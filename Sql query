@@ -1,0 +1,45 @@
+-- Basic
+SELECT TOP 50 
+    c.ContractID, 
+    m.TermFeeMethodID,
+    (TermFeeMethod) = m.Name,
+    mc.TermFeeMethodCategoryID, 
+    (TermFeeMethodCategory) = mc.Name,
+    ct.ContractTypeID,
+    (ContractType) = ct.Name,
+    c.ContractLength,
+    [ContractStartDate] = crm.contract.GetContractStartDate2(c.ContractID),
+    [ContractAnniversaryDate] = crm.contract.GetContractAnniversaryDate2(c.ContractID),
+    wd.PerProduct,
+    wd.Rate,
+    wd.DiscountedAmount
+FROM crm.contract.ContractType c
+INNER JOIN crm.contract.ContractType ct
+    ON ct.ContractTypeID = c.ContractTypeFK
+INNER JOIN #Discounts d 
+    ON c.ContractID = d.ContractFK
+INNER JOIN wd.Discounts wd 
+    ON c.ContractID = wd.ContractFK
+INNER JOIN crm.contract.TermFeeMethod m
+    ON m.TermFeeMethodID = c.TermFeeMethodFK
+INNER JOIN crm.contract.TermFeeMethodCategory mc
+    ON mc.TermFeeMethodCategoryID = m.TermFeeMethodCategoryFK
+LEFT JOIN crm.contract.VATRate vat
+    ON vat.VATRateID = m.VATRateFK
+WHERE ct.ContractTypeID IN (1) 
+    AND crm.contract.GetContractStartDate2(c.ContractID) IS NOT NULL
+    AND m.TermFeeMethodID IN (61, 56, 61, 70)
+    AND m.TermFeeMethodCategoryID = 2
+ORDER BY wd.ContractID DESC;
+
+
+
+SELECT TOP 100 
+    c.ContractID, 
+    c.ContractTypeFK, 
+    c.TermFeeMethodFK, 
+    m.Name 
+FROM crm.contract.Contract c
+LEFT JOIN crm.contract.TermFeeMethod m 
+    ON m.TermFeeMethodID = c.TermFeeMethodFK;
+
