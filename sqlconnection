@@ -1,0 +1,36 @@
+- task: PowerShell@2
+  displayName: 'Test SQL Connectivity'
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Define connection string
+              
+
+              $connectionString = "Server=tcp:tetsqlserver04.database.windows.net,1433;Database=testsqldb04;User ID=admin445566;Password=Sivasaisatvik@4;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+
+              $connection = New-Object System.Data.SqlClient.SqlConnection
+              $connection.ConnectionString = $connectionString
+
+              try {
+                  $connection.Open()
+                  Write-Host "Connected successfully!"
+
+                  # Run a query
+                  $query = "SELECT GETDATE() AS CurrentTime"
+                  $command = $connection.CreateCommand()
+                  $command.CommandText = $query
+
+                  $reader = $command.ExecuteReader()
+
+                  while ($reader.Read()) {
+                      Write-Host "Current Time from DB:" $reader["CurrentTime"]
+                  }
+
+                  $reader.Close()
+              }
+              catch {
+                  Write-Error "Connection failed: $_"
+              }
+              finally {
+                  $connection.Close()
+              }
