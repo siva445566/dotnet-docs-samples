@@ -1,0 +1,54 @@
+$tenantId     = "bdb7eeef-bbff-4830-b31c-83ccfc4a66ee"
+              $clientId     = "cae0a646-d1e6-44ea-97c2-f05117e43deb"
+              $clientSecret = "clz8Q~M_0t7S3tGj3hYYIOiSDThUpuzSv4fKHcfI"
+
+              $server   = "tetsqlserver04.database.windows.net"
+              $database = "testsqldb04"
+
+              # ---- GET ACCESS TOKEN ----
+              $resource = "https://database.windows.net/"
+
+              $body = @{
+                  grant_type    = "client_credentials"
+                  client_id     = $clientId
+                  client_secret = $clientSecret
+                  scope         = "$resource/.default"
+              }
+
+              $tokenResponse = Invoke-RestMethod -Method Post `
+                  -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" `
+                  -Body $body
+
+              $accessToken = $tokenResponse.access_token
+
+              # ---- CONNECTION STRING (NO AUTH FIELD) ----
+              $connectionString = "Server=tcp:$server,1433;Database=$database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+
+              # ---- OPEN SQL CONNECTION ----
+              Add-Type -AssemblyName "System.Data"
+
+              $connection = New-Object System.Data.SqlClient.SqlConnection
+              $connection.ConnectionString = $connectionString
+
+              # IMPORTANT: Attach Azure AD token here
+              $connection.AccessToken = $accessToken
+
+              try {
+                  $connection.Open()
+                  Write-Host "Connection successful using Service Principal authentication"
+
+                  # Example query
+                  $cmd = $connection.CreateCommand()
+                  $cmd.CommandText = "SELECT TOP 1 GETDATE()"
+                  $result = $cmd.ExecuteScalar()
+
+                  Write-Host "Server Time: $result"
+              }
+              catch {
+                  Write-Host "Connection failed: $($_.Exception.Message)"
+              }
+              finally {
+                  if ($connection.State -eq "Open") {
+                      $connection.Close()
+                  }
+              }
