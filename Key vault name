@@ -1,0 +1,136 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$VaultName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$SecretNames,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NewSecretNames
+)
+
+# ─────────────────────────────────────────────
+# 0. Check and install Az modules if missing
+# ─────────────────────────────────────────────
+Write-Host "`n[INFO] Checking Az.KeyVault module..." -ForegroundColor Cyan
+if (-not (Get-Module -ListAvailable -Name Az.KeyVault)) {
+    Write-Host "[WARN] Az.KeyVault not found. Installing..." -ForegroundColor Yellow
+    Install-Module -Name Az.KeyVault  -Scope CurrentUser -Force -AllowClobber
+    Install-Module -Name Az.Accounts -Scope CurrentUser -Force -AllowClobber
+}
+Import-Module Az.KeyVault  -ErrorAction Stop
+Import-Module Az.Accounts  -ErrorAction Stop
+Write-Host "[OK]   Az modules loaded." -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 1. Verify Azure login (AzurePowerShell@5 handles this automatically)
+# ─────────────────────────────────────────────
+$context = Get-AzContext
+if (-not $context) {
+    Write-Host "##vso[task.logissue type=error]No Azure context found. Ensure the pipeline uses AzurePowerShell@5 task."
+    exit 1
+}
+Write-Host "[OK]   Authenticated as: $($context.Account) | Subscription: $($context.Subscription.Name)" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 2. Parse and validate input lists
+# ─────────────────────────────────────────────
+$oldNames = $SecretNames.Split(',')    | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+$newNames = $NewSecretNames.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+
+if ($oldNames.Count -eq 0 -or $newNames.Count -eq 0) {
+    Write-Host "##vso[task.logissue type=error]SecretNames or NewSecretNames is empty."
+    exit 1
+}
+
+if ($oldNames.Count -ne $newNames.Count) {
+    Write-Host "##vso[task.logissue type=error]Mismatch: $($oldNames.Count) old name(s) vs $($newNames.Count) new name(s). Counts must match."
+    exit 1
+}
+
+Write-Host "`n[INFO] Vault      : $VaultName"
+Write-Host "[INFO] Operations : $($oldNames.Count) secret rename(s)"
+
+# ─────────────────────────────────────────────
+# 3. Process each secret pair
+# ─────────────────────────────────────────────
+$results  = @()
+$hasError = $false
+
+for ($i = 0; $i -lt $oldNames.Count; $i++) {
+    $oldName = $oldNames[$i]
+    $newName = $newNames[$i]
+
+    Write-Host "`n──────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "[$($i+1)/$($oldNames.Count)] '$oldName'  →  '$newName'" -ForegroundColor Cyan
+
+    # 3a. Fetch source secret
+    try {
+        $sourceSecret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $oldName -ErrorAction Stop
+    }
+    catch {
+        Write-Host "##vso[task.logissue type=warning]Source secret '$oldName' not found in '$VaultName'. Skipping."
+        $results  += [PSCustomObject]@{ OldName = $oldName; NewName = $newName; Status = "SKIPPED - source not found" }
+        $hasError  = $true
+        continue
+    }
+
+    # 3b. Check target does not already exist (prevents versioning)
+    $targetExists = Get-AzKeyVaultSecret -VaultName $VaultName -Name $newName -ErrorAction SilentlyContinue
+    if ($targetExists) {
+        Write-Host "##vso[task.logissue type=warning]Target '$newName' already exists. Skipping to prevent versioning conflict."
+        $results  += [PSCustomObject]@{ OldName = $oldName; NewName = $newName; Status = "SKIPPED - target already exists" }
+        $hasError  = $true
+        continue
+    }
+
+    # 3c. Decode secret value from SecureString
+    $plainValue = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sourceSecret.SecretValue)
+    )
+
+    # 3d. Build parameters preserving all metadata
+    $params = @{
+        VaultName   = $VaultName
+        Name        = $newName
+        SecretValue = (ConvertTo-SecureString -String $plainValue -AsPlainText -Force)
+    }
+
+    if ($sourceSecret.ContentType) { $params['ContentType'] = $sourceSecret.ContentType }
+    if ($sourceSecret.Expires)     { $params['Expires']     = $sourceSecret.Expires     }
+    if ($sourceSecret.NotBefore)   { $params['NotBefore']   = $sourceSecret.NotBefore   }
+
+    if ($sourceSecret.Tags -and $sourceSecret.Tags.Count -gt 0) {
+        $tagHash = @{}
+        $sourceSecret.Tags.GetEnumerator() | ForEach-Object { $tagHash[$_.Key] = $_.Value }
+        $params['Tag'] = $tagHash
+    }
+
+    # 3e. Create new secret and disable old one
+    try {
+        Set-AzKeyVaultSecret @params | Out-Null
+        Write-Host "[OK]   '$newName' created successfully." -ForegroundColor Green
+
+        Update-AzKeyVaultSecret -VaultName $VaultName -Name $oldName -Enable $false | Out-Null
+        Write-Host "[OK]   '$oldName' disabled (not deleted - recoverable)." -ForegroundColor DarkYellow
+
+        $results += [PSCustomObject]@{ OldName = $oldName; NewName = $newName; Status = "SUCCESS" }
+    }
+    catch {
+        Write-Host "##vso[task.logissue type=error]Failed on '$oldName' → '$newName': $_"
+        $results  += [PSCustomObject]@{ OldName = $oldName; NewName = $newName; Status = "FAILED: $_" }
+        $hasError  = $true
+    }
+}
+
+# ─────────────────────────────────────────────
+# 4. Print summary
+# ─────────────────────────────────────────────
+Write-Host "`n══════════════ SUMMARY ══════════════" -ForegroundColor Yellow
+$results | Format-Table -AutoSize | Out-String | Write-Host
+
+if ($hasError) {
+    Write-Host "##vso[task.logissue type=warning]One or more operations had issues. Review summary above."
+}
+
+Write-Host "`n[DONE] Operation complete." -ForegroundColor Cyan
