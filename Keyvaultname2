@@ -1,0 +1,42 @@
+Let me analyze the script and make the targeted modifications.​​​​​​​​​​​​​​​​
+
+I have the script in context. Here are the two fixes I’m making:
+	1.	Disable flag — add a DisableOldSecret param ("true"/"false" string, pipeline-friendly) and gate the Update-AzKeyVaultSecret call behind it.
+	2.	Single entry bug — .Split(',') on a single value with no comma still returns a 1-element array, but the real culprit is often that $oldNames.Count vs $newNames.Count comparison or the loop. I’ll also add a guard to ensure the variable is always treated as an array (@() wrap), which is the classic PowerShell gotcha.​​​​​​​​​​​​​​​​
+
+Here’s exactly what changed and why:
+
+Fix 1 — DisableOldSecret runtime flag
+Added a new param:
+
+[string]$DisableOldSecret = "true"   # default keeps existing behaviour
+
+
+Resolved once before the loop into $shouldDisable (boolean), then the disable block is gated:
+
+if ($shouldDisable) {
+    Update-AzKeyVaultSecret ... -Enable $false
+} else {
+    # old secret left untouched
+}
+
+
+In your YAML pipeline, wire it like this:
+
+- task: AzurePowerShell@5
+  inputs:
+    ScriptArguments: >
+      -VaultName "$(VaultName)"
+      -SecretNames "$(SecretNames)"
+      -NewSecretNames "$(NewSecretNames)"
+      -DisableOldSecret "$(DisableOldSecret)"   # runtime variable: true / false
+
+
+Fix 2 — Single entry Count bug
+The root cause is a classic PowerShell gotcha — when a pipeline expression returns exactly one object, PowerShell can unroll the array and .Count behaves unexpectedly. The fix is wrapping the assignment in @():
+
+$oldNames = @( $SecretNames.Split(',') | ... )
+$newNames = @( $NewSecretNames.Split(',') | ... )
+
+
+This forces both variables to always be a proper array, so .Count is reliable whether you pass one secret or twenty.​​​​​​​​​​​​​​​​
