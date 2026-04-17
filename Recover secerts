@@ -1,0 +1,220 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$VaultName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$SecretNames
+)
+
+# ─────────────────────────────────────────────
+# 0. Check and install Az modules if missing
+# ─────────────────────────────────────────────
+Write-Host "`n[INFO] Checking required Az modules..." -ForegroundColor Cyan
+
+$requiredModules = @('Az.KeyVault', 'Az.Accounts')
+
+foreach ($module in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        Write-Host "[WARN] '$module' not found. Installing..." -ForegroundColor Yellow
+        Install-Module -Name $module -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        Write-Host "[OK]   '$module' installed." -ForegroundColor Green
+    } else {
+        Write-Host "[OK]   '$module' already available." -ForegroundColor Green
+    }
+    Import-Module $module -ErrorAction Stop
+}
+
+Write-Host "[OK]   All required modules loaded.`n" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 1. Verify Azure login
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Verifying Azure login..." -ForegroundColor Cyan
+
+$context = Get-AzContext
+if (-not $context) {
+    Write-Host "##vso[task.logissue type=error]No Azure context found. Ensure AzurePowerShell@5 task is used."
+    exit 1
+}
+
+Write-Host "[OK]   Authenticated as : $($context.Account)" -ForegroundColor Green
+Write-Host "[OK]   Subscription     : $($context.Subscription.Name)" -ForegroundColor Green
+Write-Host "[OK]   Tenant           : $($context.Tenant.Id)`n" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 2. Parse and validate input
+#    @() wrap ensures single entry is always
+#    treated as an array — critical fix
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Parsing input secret names..." -ForegroundColor Cyan
+
+$secretList = @(
+    $SecretNames.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+)
+
+if ($secretList.Count -eq 0) {
+    Write-Host "##vso[task.logissue type=error]SecretNames input is empty. Provide at least one secret name."
+    exit 1
+}
+
+Write-Host "[OK]   Total secrets to recover : $($secretList.Count)"
+Write-Host "[OK]   Vault                    : $VaultName`n"
+
+# ─────────────────────────────────────────────
+# 3. Verify the Key Vault exists and is reachable
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Verifying Key Vault '$VaultName'..." -ForegroundColor Cyan
+
+try {
+    $vault = Get-AzKeyVault -VaultName $VaultName -ErrorAction Stop
+    if (-not $vault) {
+        Write-Host "##vso[task.logissue type=error]Key Vault '$VaultName' not found or not accessible."
+        exit 1
+    }
+    Write-Host "[OK]   Key Vault found : $($vault.VaultName) | RG: $($vault.ResourceGroupName)`n" -ForegroundColor Green
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]Failed to access Key Vault '$VaultName': $_"
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# 4. Fetch ALL deleted secrets once (efficient —
+#    avoids a separate API call per secret)
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Fetching deleted secrets list from '$VaultName'..." -ForegroundColor Cyan
+
+try {
+    $allDeletedSecrets = @(Get-AzKeyVaultSecret -VaultName $VaultName -InRemovedState -ErrorAction Stop)
+    Write-Host "[OK]   Total deleted secrets found in vault : $($allDeletedSecrets.Count)`n" -ForegroundColor Green
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]Failed to retrieve deleted secrets: $_"
+    exit 1
+}
+
+if ($allDeletedSecrets.Count -eq 0) {
+    Write-Host "[WARN] No deleted secrets exist in '$VaultName'. Nothing to recover." -ForegroundColor Yellow
+    exit 0
+}
+
+# ─────────────────────────────────────────────
+# 5. Process each secret recovery
+# ─────────────────────────────────────────────
+$results  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$hasError = $false
+
+for ($i = 0; $i -lt $secretList.Count; $i++) {
+    $secretName = $secretList[$i]
+
+    Write-Host "──────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "[$($i+1)/$($secretList.Count)] Processing : '$secretName'" -ForegroundColor Cyan
+
+    # 5a. Check if secret exists in deleted state
+    #     Match against the pre-fetched list (case-insensitive)
+    $deletedSecret = $allDeletedSecrets | Where-Object {
+        $_.Name -ieq $secretName
+    } | Select-Object -First 1
+
+    if (-not $deletedSecret) {
+        Write-Host "##vso[task.logissue type=warning]'$secretName' not found in deleted secrets. It may be active, purged, or misspelled." -ForegroundColor Yellow
+
+        # Extra hint — check if it's currently active
+        $activeSecret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $secretName -ErrorAction SilentlyContinue
+        if ($activeSecret) {
+            Write-Host "[HINT] '$secretName' is currently ACTIVE in the vault — no recovery needed." -ForegroundColor Green
+            $results.Add([PSCustomObject]@{
+                SecretName    = $secretName
+                ScheduledPurge = "N/A"
+                Status        = "SKIPPED - already active"
+            })
+        } else {
+            Write-Host "[HINT] '$secretName' not found anywhere — likely already purged or wrong name." -ForegroundColor Red
+            $results.Add([PSCustomObject]@{
+                SecretName    = $secretName
+                ScheduledPurge = "N/A"
+                Status        = "SKIPPED - not found in deleted list"
+            })
+            $hasError = $true
+        }
+        continue
+    }
+
+    # 5b. Show metadata before recovery
+    Write-Host "[INFO] Deleted on      : $($deletedSecret.DeletedDate)" -ForegroundColor DarkYellow
+    Write-Host "[INFO] Scheduled purge : $($deletedSecret.ScheduledPurgeDate)" -ForegroundColor DarkYellow
+
+    # 5c. Recover the secret
+    try {
+        Undo-AzKeyVaultSecretRemoval -VaultName $VaultName -Name $secretName -ErrorAction Stop | Out-Null
+        Write-Host "[OK]   '$secretName' recovered successfully." -ForegroundColor Green
+
+        $results.Add([PSCustomObject]@{
+            SecretName     = $secretName
+            ScheduledPurge = $deletedSecret.ScheduledPurgeDate
+            Status         = "RECOVERED"
+        })
+    }
+    catch {
+        Write-Host "##vso[task.logissue type=error]Failed to recover '$secretName': $_"
+        $results.Add([PSCustomObject]@{
+            SecretName     = $secretName
+            ScheduledPurge = $deletedSecret.ScheduledPurgeDate
+            Status         = "FAILED: $_"
+        })
+        $hasError = $true
+    }
+}
+
+# ─────────────────────────────────────────────
+# 6. Final summary
+# ─────────────────────────────────────────────
+Write-Host "`n══════════════════════ SUMMARY ══════════════════════" -ForegroundColor Yellow
+$results | Format-Table -AutoSize | Out-String | Write-Host
+
+$recovered = ($results | Where-Object { $_.Status -eq "RECOVERED" }).Count
+$skipped   = ($results | Where-Object { $_.Status -like "SKIPPED*" }).Count
+$failed    = ($results | Where-Object { $_.Status -like "FAILED*" }).Count
+
+Write-Host "  ✔  Recovered : $recovered" -ForegroundColor Green
+Write-Host "  ⚠  Skipped   : $skipped"   -ForegroundColor Yellow
+Write-Host "  ✖  Failed    : $failed`n"  -ForegroundColor Red
+
+if ($hasError) {
+    Write-Host "##vso[task.logissue type=warning]One or more secrets had issues. Review the summary above."
+}
+
+Write-Host "[DONE] Recovery operation complete." -ForegroundColor Cyan
+
+
+
+parameters:
+  - name: VaultName
+    displayName: 'Key Vault Name'
+    type: string
+
+  - name: SecretNames
+    displayName: 'Secret Name(s) to Recover (comma-separated)'
+    type: string
+
+stages:
+  - stage: RecoverSecrets
+    displayName: 'Recover Deleted Key Vault Secrets'
+    jobs:
+      - job: RecoverJob
+        displayName: 'Undo Secret Deletion'
+        pool:
+          vmImage: 'windows-latest'
+        steps:
+          - task: AzurePowerShell@5
+            displayName: 'Recover Deleted Secrets'
+            inputs:
+              azureSubscription: '$(ServiceConnection)'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(System.DefaultWorkingDirectory)/Recover-KeyVaultSecrets.ps1'
+              ScriptArguments: >
+                -VaultName "${{ parameters.VaultName }}"
+                -SecretNames "${{ parameters.SecretNames }}"
+              azurePowerShellVersion: 'LatestVersion'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
