@@ -1,0 +1,199 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroupName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$AppServiceName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$IPAddresses   # comma-separated
+)
+
+# ─────────────────────────────────────────────
+# 0. Check and install Az modules if missing
+# ─────────────────────────────────────────────
+Write-Host "`n[INFO] Checking required Az modules..." -ForegroundColor Cyan
+
+$requiredModules = @('Az.Websites', 'Az.Accounts')
+
+foreach ($module in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        Write-Host "[WARN] '$module' not found. Installing..." -ForegroundColor Yellow
+        Install-Module -Name $module -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        Write-Host "[OK]   '$module' installed." -ForegroundColor Green
+    } else {
+        Write-Host "[OK]   '$module' already available." -ForegroundColor Green
+    }
+    Import-Module $module -ErrorAction Stop
+}
+
+Write-Host "[OK]   All required modules loaded.`n" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 1. Verify Azure login
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Verifying Azure login..." -ForegroundColor Cyan
+
+$context = Get-AzContext
+if (-not $context) {
+    Write-Host "##vso[task.logissue type=error]No Azure context found."
+    exit 1
+}
+
+Write-Host "[OK]   Authenticated as : $($context.Account)" -ForegroundColor Green
+Write-Host "[OK]   Subscription     : $($context.Subscription.Name)`n" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 2. Parse IP input
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Parsing IP addresses..." -ForegroundColor Cyan
+
+$ipList = @(
+    $IPAddresses.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+)
+
+if ($ipList.Count -eq 0) {
+    Write-Host "##vso[task.logissue type=error]No IP addresses provided."
+    exit 1
+}
+
+Write-Host "[OK]   Total IPs : $($ipList.Count)`n"
+
+# ─────────────────────────────────────────────
+# 3. Get existing App Service config
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Fetching App Service configuration..." -ForegroundColor Cyan
+
+try {
+    $webApp = Get-AzWebApp -ResourceGroupName $ResourceGroupName -Name $AppServiceName -ErrorAction Stop
+    $config = Get-AzWebAppAccessRestrictionConfig -ResourceGroupName $ResourceGroupName -Name $AppServiceName
+    $existingRules = @($config.MainSiteAccessRestrictions)
+
+    Write-Host "[OK]   App Service found : $AppServiceName"
+    Write-Host "[OK]   Existing rules    : $($existingRules.Count)`n"
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]Failed to fetch App Service: $_"
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# 4. Process IP updates
+# ─────────────────────────────────────────────
+$results  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$priority = 100
+
+foreach ($ip in $ipList) {
+
+    Write-Host "────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "[INFO] Processing IP : $ip" -ForegroundColor Cyan
+
+    # Normalize IP format
+    if ($ip -notmatch "/") {
+        $ip = "$ip/32"
+    }
+
+    $exists = $existingRules | Where-Object {
+        $_.IpAddress -eq $ip
+    }
+
+    if ($exists) {
+        Write-Host "[INFO] IP already exists in rules." -ForegroundColor Yellow
+
+        $results.Add([PSCustomObject]@{
+            IP     = $ip
+            Status = "ALREADY EXISTS"
+        })
+        continue
+    }
+
+    try {
+        # Find next priority
+        if ($existingRules.Count -gt 0) {
+            $priority = ($existingRules | Measure-Object Priority -Maximum).Maximum + 1
+        }
+
+        Add-AzWebAppAccessRestrictionRule `
+            -ResourceGroupName $ResourceGroupName `
+            -WebAppName $AppServiceName `
+            -Name "Allow_$($ip.Replace('/','_'))" `
+            -Priority $priority `
+            -Action Allow `
+            -IpAddress $ip `
+            -ErrorAction Stop
+
+        Write-Host "[OK]   IP added successfully." -ForegroundColor Green
+
+        $results.Add([PSCustomObject]@{
+            IP     = $ip
+            Status = "ADDED"
+        })
+
+        # refresh rules
+        $config = Get-AzWebAppAccessRestrictionConfig -ResourceGroupName $ResourceGroupName -Name $AppServiceName
+        $existingRules = @($config.MainSiteAccessRestrictions)
+
+    }
+    catch {
+        Write-Host "##vso[task.logissue type=error]Failed to add IP $ip : $_"
+
+        $results.Add([PSCustomObject]@{
+            IP     = $ip
+            Status = "FAILED"
+        })
+    }
+}
+
+# ─────────────────────────────────────────────
+# 5. Summary
+# ─────────────────────────────────────────────
+Write-Host "`n══════════════ SUMMARY ══════════════" -ForegroundColor Yellow
+$results | Format-Table -AutoSize | Out-String | Write-Host
+
+$added   = ($results | Where-Object { $_.Status -eq "ADDED" }).Count
+$exists  = ($results | Where-Object { $_.Status -eq "ALREADY EXISTS" }).Count
+$failed  = ($results | Where-Object { $_.Status -eq "FAILED" }).Count
+
+Write-Host "✔ Added    : $added" -ForegroundColor Green
+Write-Host "⚠ Exists   : $exists" -ForegroundColor Yellow
+Write-Host "✖ Failed   : $failed" -ForegroundColor Red
+
+Write-Host "[DONE] Firewall update completed." -ForegroundColor Cyano
+
+
+parameters:
+  - name: ResourceGroupName
+    displayName: 'Resource Group Name'
+    type: string
+
+  - name: AppServiceName
+    displayName: 'App Service Name'
+    type: string
+
+  - name: IPAddresses
+    displayName: 'IP Address(es) (comma-separated)'
+    type: string
+
+stages:
+  - stage: UpdateFirewall
+    displayName: 'Update App Service Firewall Rules'
+    jobs:
+      - job: FirewallJob
+        displayName: 'Update IP Restrictions'
+        pool:
+          vmImage: 'windows-latest'
+
+        steps:
+          - task: AzurePowerShell@5
+            displayName: 'Update App Service IP Rules'
+            inputs:
+              azureSubscription: '$(ServiceConnection)'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(System.DefaultWorkingDirectory)/Update-AppServiceFirewall.ps1'
+              ScriptArguments: >
+                -ResourceGroupName "${{ parameters.ResourceGroupName }}"
+                -AppServiceName "${{ parameters.AppServiceName }}"
+                -IPAddresses "${{ parameters.IPAddresses }}"
+              azurePowerShellVersion: 'LatestVersion'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
