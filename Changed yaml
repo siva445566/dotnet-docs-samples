@@ -13,32 +13,51 @@ parameters:
     displayName: 'Secret Name(s) to Recover (comma-separated)'
     type: string
 
-variables:
-  # ── Environment → Subscription + KeyVault mapping ──────────────────────────
-  # dev
-  ${{ if eq(parameters.Environment, 'dev') }}:
-    azureSubscription: 'azuresub-dev'
-    keyVaultName: 'azure-devkey'
-
-  # test and uat share the same sub and vault
-  ${{ if or(eq(parameters.Environment, 'test'), eq(parameters.Environment, 'uat')) }}:
-    azureSubscription: 'azuresub-test'
-    keyVaultName: 'azure-testkey'
-
-  # preprod and prod share the same sub and vault
-  ${{ if or(eq(parameters.Environment, 'preprod'), eq(parameters.Environment, 'prod')) }}:
-    azureSubscription: 'azure-prod'
-    keyVaultName: 'azure-prodkey'
-
 stages:
   - stage: RecoverSecrets
     displayName: 'Recover Secrets [${{ parameters.Environment }}]'
     jobs:
       - job: RecoverJob
-        displayName: 'Recover from $(keyVaultName)'
+        displayName: 'Recover Deleted Secrets'
         pool:
           vmImage: 'windows-latest'
         steps:
+
+          # ── Step 1: Resolve subscription and vault based on environment ──
+          - task: PowerShell@2
+            displayName: 'Set Environment Variables'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $env = "${{ parameters.Environment }}"
+
+                switch ($env) {
+                  "dev" {
+                    $sub   = "azuresub-dev"
+                    $vault = "azure-devkey"
+                  }
+                  { $_ -in "test", "uat" } {
+                    $sub   = "azuresub-test"
+                    $vault = "azure-testkey"
+                  }
+                  { $_ -in "preprod", "prod" } {
+                    $sub   = "azure-prod"
+                    $vault = "azure-prodkey"
+                  }
+                  default {
+                    Write-Host "##vso[task.logissue type=error]Unknown environment: $env"
+                    exit 1
+                  }
+                }
+
+                Write-Host "##vso[task.setvariable variable=azureSubscription]$sub"
+                Write-Host "##vso[task.setvariable variable=keyVaultName]$vault"
+
+                Write-Host "[OK] Environment  : $env"  -ForegroundColor Green
+                Write-Host "[OK] Subscription : $sub"  -ForegroundColor Green
+                Write-Host "[OK] Key Vault    : $vault" -ForegroundColor Green
+
+          # ── Step 2: Use resolved variables in the actual task ────────────
           - task: AzurePowerShell@5
             displayName: 'Recover Deleted Secrets - ${{ parameters.Environment }}'
             inputs:
