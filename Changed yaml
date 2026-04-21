@@ -1,0 +1,51 @@
+parameters:
+  - name: Environment
+    displayName: 'Select Environment'
+    type: string
+    values:
+      - dev
+      - test
+      - uat
+      - preprod
+      - prod
+
+  - name: SecretNames
+    displayName: 'Secret Name(s) to Recover (comma-separated)'
+    type: string
+
+variables:
+  # ── Environment → Subscription + KeyVault mapping ──────────────────────────
+  # dev
+  ${{ if eq(parameters.Environment, 'dev') }}:
+    azureSubscription: 'azuresub-dev'
+    keyVaultName: 'azure-devkey'
+
+  # test and uat share the same sub and vault
+  ${{ if or(eq(parameters.Environment, 'test'), eq(parameters.Environment, 'uat')) }}:
+    azureSubscription: 'azuresub-test'
+    keyVaultName: 'azure-testkey'
+
+  # preprod and prod share the same sub and vault
+  ${{ if or(eq(parameters.Environment, 'preprod'), eq(parameters.Environment, 'prod')) }}:
+    azureSubscription: 'azure-prod'
+    keyVaultName: 'azure-prodkey'
+
+stages:
+  - stage: RecoverSecrets
+    displayName: 'Recover Secrets [${{ parameters.Environment }}]'
+    jobs:
+      - job: RecoverJob
+        displayName: 'Recover from $(keyVaultName)'
+        pool:
+          vmImage: 'windows-latest'
+        steps:
+          - task: AzurePowerShell@5
+            displayName: 'Recover Deleted Secrets - ${{ parameters.Environment }}'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(System.DefaultWorkingDirectory)/Recover-KeyVaultSecrets.ps1'
+              ScriptArguments: >
+                -VaultName "$(keyVaultName)"
+                -SecretNames "${{ parameters.SecretNames }}"
+              azurePowerShellVersion: 'LatestVersion'
