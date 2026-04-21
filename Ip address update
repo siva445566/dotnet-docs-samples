@@ -1,0 +1,267 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroupName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$AppServiceName,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^(\d{1,3}\.){3}\d{1,3}$')]
+    [string]$NewIPAddress
+)
+
+# ─────────────────────────────────────────────
+# 0. Check and install required Az modules
+# ─────────────────────────────────────────────
+Write-Host "`n[INFO] Checking required Az modules..." -ForegroundColor Cyan
+
+$requiredModules = @('Az.Accounts', 'Az.Websites')
+
+foreach ($module in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        Write-Host "[WARN] '$module' not found. Installing..." -ForegroundColor Yellow
+        Install-Module -Name $module -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        Write-Host "[OK]   '$module' installed." -ForegroundColor Green
+    } else {
+        Write-Host "[OK]   '$module' already available." -ForegroundColor Green
+    }
+    Import-Module $module -ErrorAction Stop
+}
+
+Write-Host "[OK]   All required modules loaded.`n" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 1. Verify Azure login
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Verifying Azure login..." -ForegroundColor Cyan
+
+$context = Get-AzContext
+if (-not $context) {
+    Write-Host "##vso[task.logissue type=error]No Azure context found. Ensure AzurePowerShell@5 task is used."
+    exit 1
+}
+
+Write-Host "[OK]   Authenticated as  : $($context.Account)"           -ForegroundColor Green
+Write-Host "[OK]   Subscription      : $($context.Subscription.Name)" -ForegroundColor Green
+Write-Host "[OK]   Tenant            : $($context.Tenant.Id)`n"       -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 2. Validate IP address format (each octet 0-255)
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Validating IP address '$NewIPAddress'..." -ForegroundColor Cyan
+
+$octets = $NewIPAddress.Split('.')
+$validIP = $true
+
+foreach ($octet in $octets) {
+    $val = [int]$octet
+    if ($val -lt 0 -or $val -gt 255) {
+        $validIP = $false
+        break
+    }
+}
+
+if (-not $validIP) {
+    Write-Host "##vso[task.logissue type=error]Invalid IP address '$NewIPAddress'. Each octet must be between 0 and 255."
+    exit 1
+}
+
+# Append /32 if not already provided
+$ipWithCIDR = "$NewIPAddress/32"
+Write-Host "[OK]   IP validated. Will apply as : $ipWithCIDR`n" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 3. Verify App Service exists
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Verifying App Service '$AppServiceName'..." -ForegroundColor Cyan
+
+try {
+    $appService = Get-AzWebApp -ResourceGroupName $ResourceGroupName -Name $AppServiceName -ErrorAction Stop
+    Write-Host "[OK]   App Service found : $($appService.Name)" -ForegroundColor Green
+    Write-Host "[OK]   Resource Group    : $($appService.ResourceGroup)" -ForegroundColor Green
+    Write-Host "[OK]   Location          : $($appService.Location)`n"    -ForegroundColor Green
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]App Service '$AppServiceName' not found in Resource Group '$ResourceGroupName': $_"
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# 4. Fetch existing access restriction rules
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Fetching existing firewall rules..." -ForegroundColor Cyan
+
+try {
+    $resourceId  = $appService.Id
+    $apiVersion  = "2022-03-01"
+    $configUrl   = "https://management.azure.com$($resourceId)/config/web?api-version=$apiVersion"
+    $token       = (Get-AzAccessToken -ResourceUrl "https://management.azure.com/").Token
+
+    $headers = @{
+        Authorization  = "Bearer $token"
+        'Content-Type' = 'application/json'
+    }
+
+    $webConfig   = Invoke-RestMethod -Uri $configUrl -Headers $headers -Method Get -ErrorAction Stop
+    $ipRules     = $webConfig.properties.ipSecurityRestrictions
+
+    Write-Host "[OK]   Total existing rules found : $($ipRules.Count)`n" -ForegroundColor Green
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]Failed to fetch App Service config: $_"
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# 5. Locate the rule with priority 115
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Searching for rule with priority 115..." -ForegroundColor Cyan
+
+$targetRule = $ipRules | Where-Object { $_.priority -eq 115 } | Select-Object -First 1
+
+if (-not $targetRule) {
+    Write-Host "##vso[task.logissue type=error]No firewall rule with priority 115 found in '$AppServiceName'. Failing pipeline as requested."
+    Write-Host "`n[INFO] Existing rules in the App Service:"
+    $ipRules | ForEach-Object {
+        Write-Host "       Priority: $($_.priority) | Name: $($_.name) | IP: $($_.ipAddress)" -ForegroundColor DarkYellow
+    }
+    exit 1
+}
+
+Write-Host "[OK]   Rule found!" -ForegroundColor Green
+Write-Host "       Name     : $($targetRule.name)"      -ForegroundColor DarkYellow
+Write-Host "       Priority : $($targetRule.priority)"  -ForegroundColor DarkYellow
+Write-Host "       Old IP   : $($targetRule.ipAddress)" -ForegroundColor DarkYellow
+Write-Host "       Action   : $($targetRule.action)`n"  -ForegroundColor DarkYellow
+
+# Store original rule name — name stays the same per requirement
+$ruleName   = $targetRule.name
+$oldIP      = $targetRule.ipAddress
+
+if ($oldIP -eq $ipWithCIDR) {
+    Write-Host "[WARN] The IP address '$ipWithCIDR' is already set on rule '$ruleName'. No update needed." -ForegroundColor Yellow
+    Write-Host "`n[DONE] No changes made." -ForegroundColor Cyan
+    exit 0
+}
+
+# ─────────────────────────────────────────────
+# 6. Update the IP on the matched rule (in-memory)
+#    All other rules and their properties are
+#    preserved exactly — only ipAddress changes
+# ─────────────────────────────────────────────
+Write-Host "[INFO] Updating IP address on rule '$ruleName'..." -ForegroundColor Cyan
+
+$targetRule.ipAddress = $ipWithCIDR
+
+# ─────────────────────────────────────────────
+# 7. Push the full updated config back to Azure
+#    via REST (Az.Websites cmdlets don't support
+#    partial rule updates cleanly — REST is safer)
+# ─────────────────────────────────────────────
+try {
+    $updateBody = @{
+        properties = @{
+            ipSecurityRestrictions = $ipRules
+        }
+    } | ConvertTo-Json -Depth 10
+
+    Invoke-RestMethod -Uri $configUrl -Headers $headers -Method Patch -Body $updateBody -ErrorAction Stop | Out-Null
+
+    Write-Host "[OK]   Rule '$ruleName' updated successfully." -ForegroundColor Green
+    Write-Host "       Old IP : $oldIP"     -ForegroundColor DarkYellow
+    Write-Host "       New IP : $ipWithCIDR" -ForegroundColor Green
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]Failed to update firewall rule: $_"
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# 8. Verify the update was applied correctly
+# ─────────────────────────────────────────────
+Write-Host "`n[INFO] Verifying update was applied..." -ForegroundColor Cyan
+
+try {
+    $verifyConfig   = Invoke-RestMethod -Uri $configUrl -Headers $headers -Method Get -ErrorAction Stop
+    $verifiedRule   = $verifyConfig.properties.ipSecurityRestrictions | Where-Object { $_.priority -eq 115 }
+
+    if ($verifiedRule.ipAddress -eq $ipWithCIDR) {
+        Write-Host "[OK]   Verification passed! Rule confirmed in Azure." -ForegroundColor Green
+        Write-Host "       Name     : $($verifiedRule.name)"      -ForegroundColor Green
+        Write-Host "       Priority : $($verifiedRule.priority)"  -ForegroundColor Green
+        Write-Host "       IP       : $($verifiedRule.ipAddress)" -ForegroundColor Green
+    } else {
+        Write-Host "##vso[task.logissue type=warning]Verification mismatch! Expected '$ipWithCIDR' but got '$($verifiedRule.ipAddress)'."
+    }
+}
+catch {
+    Write-Host "##vso[task.logissue type=warning]Could not verify update. Please check manually: $_"
+}
+
+Write-Host "`n[DONE] Firewall rule update complete." -ForegroundColor Cyan
+
+yaml:
+parameters:
+  - name: ResourceGroupName
+    displayName: 'Resource Group Name'
+    type: string
+
+  - name: AppServiceName
+    displayName: 'App Service Name'
+    type: string
+
+  - name: NewIPAddress
+    displayName: 'New IP Address (without /32 — script adds it automatically)'
+    type: string
+
+  - name: ServiceConnection
+    displayName: 'Azure Service Connection'
+    type: string
+
+stages:
+  - stage: UpdateFirewallRule
+    displayName: 'Update App Service Firewall Rule'
+    jobs:
+      - job: UpdateIPRule
+        displayName: 'Update Priority 115 Rule - ${{ parameters.AppServiceName }}'
+        pool:
+          vmImage: 'windows-latest'
+        steps:
+
+          # ── Step 1: Validate IP format before even hitting Azure ──────────
+          - task: PowerShell@2
+            displayName: 'Pre-Validate IP Address'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ip = "${{ parameters.NewIPAddress }}"
+
+                if ($ip -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+                  Write-Host "##vso[task.logissue type=error]'$ip' is not a valid IPv4 address format."
+                  exit 1
+                }
+
+                $octets = $ip.Split('.')
+                foreach ($octet in $octets) {
+                  if ([int]$octet -lt 0 -or [int]$octet -gt 255) {
+                    Write-Host "##vso[task.logissue type=error]Octet '$octet' is out of range. Each octet must be 0-255."
+                    exit 1
+                  }
+                }
+
+                Write-Host "[OK] IP address '$ip' is valid. Will be applied as '$ip/32'." -ForegroundColor Green
+
+          # ── Step 2: Run the actual update script ─────────────────────────
+          - task: AzurePowerShell@5
+            displayName: 'Update Firewall Rule IP - Priority 115'
+            inputs:
+              azureSubscription: '${{ parameters.ServiceConnection }}'
+              ScriptType: 'FilePath'
+              ScriptPath: '$(System.DefaultWorkingDirectory)/Update-AppServiceFirewallRule.ps1'
+              ScriptArguments: >
+                -ResourceGroupName "${{ parameters.ResourceGroupName }}"
+                -AppServiceName "${{ parameters.AppServiceName }}"
+                -NewIPAddress "${{ parameters.NewIPAddress }}"
+              azurePowerShellVersion: 'LatestVersion'
+
+
