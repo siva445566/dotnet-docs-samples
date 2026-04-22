@@ -74,17 +74,20 @@ for ($i = 0; $i -lt $oldNames.Count; $i++) {
 
     Write-Host "`n──────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host "[$($i+1)/$($oldNames.Count)] '$oldName'  →  '$newName'" -ForegroundColor Cyan
+# 3a. Fetch source secret
+try {
+    $sourceSecret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $oldName -ErrorAction Stop
+}
+catch {
+    Write-Host "##vso[task.logissue type=error]Source secret '$oldName' not found in vault '$VaultName'. Aborting pipeline."
+    exit 1
+}
 
-    # 3a. Fetch source secret
-    try {
-        $sourceSecret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $oldName -ErrorAction Stop
-    }
-    catch {
-        Write-Host "##vso[task.logissue type=warning]Source secret '$oldName' not found in '$VaultName'. Skipping."
-        $results  += [PSCustomObject]@{ OldName = $oldName; NewName = $newName; OldSecretState = "N/A"; Status = "SKIPPED - source not found" }
-        $hasError  = $true
-        continue
-    }
+# Guard: secret exists but has no value (deleted/null)
+if ($null -eq $sourceSecret -or $null -eq $sourceSecret.SecretValue) {
+    Write-Host "##vso[task.logissue type=error]Source secret '$oldName' was found but has a null value (possibly soft-deleted or empty). Aborting pipeline."
+    exit 1
+}
 
     # 3b. Check target does not already exist
     $targetExists = Get-AzKeyVaultSecret -VaultName $VaultName -Name $newName -ErrorAction SilentlyContinue
