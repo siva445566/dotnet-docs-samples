@@ -1,0 +1,211 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$VaultName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$SecretNames,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NewSecretNames,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("true", "false", IgnoreCase = $true)]
+    [string]$DisableOldSecret = "true"
+)
+
+# ─────────────────────────────────────────────
+# 0. Check and install Az modules if missing
+# ─────────────────────────────────────────────
+Write-Host "`n[INFO] Checking Az.KeyVault module..." -ForegroundColor Cyan
+if (-not (Get-Module -ListAvailable -Name Az.KeyVault)) {
+    Write-Host "[WARN] Az.KeyVault not found. Installing..." -ForegroundColor Yellow
+    Install-Module -Name Az.KeyVault  -Scope CurrentUser -Force -AllowClobber
+    Install-Module -Name Az.Accounts -Scope CurrentUser -Force -AllowClobber
+}
+Import-Module Az.KeyVault  -ErrorAction Stop
+Import-Module Az.Accounts  -ErrorAction Stop
+Write-Host "[OK]   Az modules loaded." -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 1. Verify Azure login
+# ─────────────────────────────────────────────
+$context = Get-AzContext
+if (-not $context) {
+    Write-Host "##vso[task.logissue type=error]No Azure context found. Ensure the pipeline uses AzurePowerShell@5 task."
+    exit 1
+}
+Write-Host "[OK]   Authenticated as: $($context.Account) | Subscription: $($context.Subscription.Name)" -ForegroundColor Green
+
+# ─────────────────────────────────────────────
+# 2. Parse and validate input lists
+# ─────────────────────────────────────────────
+$oldNames = @(
+    $SecretNames.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+)
+$newNames = @(
+    $NewSecretNames.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+)
+
+if ($oldNames.Count -eq 0 -or $newNames.Count -eq 0) {
+    Write-Host "##vso[task.logissue type=error]SecretNames or NewSecretNames is empty."
+    exit 1
+}
+
+if ($oldNames.Count -ne $newNames.Count) {
+    Write-Host "##vso[task.logissue type=error]Mismatch: $($oldNames.Count) old name(s) vs $($newNames.Count) new name(s). Counts must match."
+    exit 1
+}
+
+$shouldDisable = $DisableOldSecret.ToLower() -eq "true"
+
+Write-Host "`n[INFO] Vault            : $VaultName"
+Write-Host "[INFO] Operations       : $($oldNames.Count) secret rename(s)"
+Write-Host "[INFO] Disable old secret after rename: $shouldDisable" -ForegroundColor $(if ($shouldDisable) { "DarkYellow" } else { "Green" })
+
+# ─────────────────────────────────────────────
+# 3. Process each secret pair
+# ─────────────────────────────────────────────
+$results  = @()
+$hasError = $false
+
+for ($i = 0; $i -lt $oldNames.Count; $i++) {
+    $oldName = $oldNames[$i]
+    $newName = $newNames[$i]
+
+    Write-Host "`n──────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "[$($i+1)/$($oldNames.Count)] '$oldName'  →  '$newName'" -ForegroundColor Cyan
+
+    # ── 3a. Fetch source secret ──────────────────────────────────────────────
+    # KEY FIX: Get-AzKeyVaultSecret returns $null silently when not found.
+    # It does NOT throw, so try/catch alone is not enough.
+    # We must explicitly check for $null after the call.
+    $sourceSecret = $null
+    try {
+        $sourceSecret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $oldName -ErrorAction SilentlyContinue
+    }
+    catch {
+        # Only fires for real errors: network, permissions, etc.
+        Write-Host "##vso[task.logissue type=warning]Error while looking up '$oldName': $_" -ForegroundColor Yellow
+        $results += [PSCustomObject]@{
+            OldName        = $oldName
+            NewName        = $newName
+            OldSecretState = "N/A"
+            Status         = "SKIPPED - lookup error: $_"
+        }
+        $hasError = $true
+        continue
+    }
+
+    # ── 3b. Check if secret actually exists ─────────────────────────────────
+    if ($null -eq $sourceSecret) {
+        Write-Host "##vso[task.logissue type=warning]Source secret '$oldName' NOT FOUND in vault '$VaultName'. Skipping this pair." -ForegroundColor Yellow
+        Write-Host "[HINT] Please recheck the name '$oldName' — it may be misspelled or in a different vault." -ForegroundColor Yellow
+        $results += [PSCustomObject]@{
+            OldName        = $oldName
+            NewName        = $newName
+            OldSecretState = "N/A"
+            Status         = "SKIPPED - source secret not found (recheck name)"
+        }
+        $hasError = $true
+        continue
+    }
+
+    # ── 3c. Guard: secret exists but value is null (soft-deleted / empty) ───
+    if ($null -eq $sourceSecret.SecretValue) {
+        Write-Host "##vso[task.logissue type=warning]Source secret '$oldName' exists but has a null/empty value (possibly soft-deleted). Skipping." -ForegroundColor Yellow
+        $results += [PSCustomObject]@{
+            OldName        = $oldName
+            NewName        = $newName
+            OldSecretState = "N/A"
+            Status         = "SKIPPED - secret value is null (soft-deleted or empty)"
+        }
+        $hasError = $true
+        continue
+    }
+
+    # ── 3d. Check target does not already exist ──────────────────────────────
+    $targetExists = Get-AzKeyVaultSecret -VaultName $VaultName -Name $newName -ErrorAction SilentlyContinue
+    if ($null -ne $targetExists) {
+        Write-Host "##vso[task.logissue type=warning]Target '$newName' already exists. Skipping to prevent versioning conflict." -ForegroundColor Yellow
+        $results += [PSCustomObject]@{
+            OldName        = $oldName
+            NewName        = $newName
+            OldSecretState = "N/A"
+            Status         = "SKIPPED - target already exists"
+        }
+        $hasError = $true
+        continue
+    }
+
+    # ── 3e. Decode secret value from SecureString ────────────────────────────
+    $plainValue = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sourceSecret.SecretValue)
+    )
+
+    # ── 3f. Build parameters preserving all metadata ─────────────────────────
+    $params = @{
+        VaultName   = $VaultName
+        Name        = $newName
+        SecretValue = (ConvertTo-SecureString -String $plainValue -AsPlainText -Force)
+    }
+
+    if ($sourceSecret.ContentType) { $params['ContentType'] = $sourceSecret.ContentType }
+    if ($sourceSecret.Expires)     { $params['Expires']     = $sourceSecret.Expires     }
+    if ($sourceSecret.NotBefore)   { $params['NotBefore']   = $sourceSecret.NotBefore   }
+
+    if ($sourceSecret.Tags -and $sourceSecret.Tags.Count -gt 0) {
+        $tagHash = @{}
+        $sourceSecret.Tags.GetEnumerator() | ForEach-Object { $tagHash[$_.Key] = $_.Value }
+        $params['Tag'] = $tagHash
+    }
+
+    # ── 3g. Create new secret, then conditionally disable old one ────────────
+    try {
+        Set-AzKeyVaultSecret @params | Out-Null
+        Write-Host "[OK]   '$newName' created successfully." -ForegroundColor Green
+
+        if ($shouldDisable) {
+            Update-AzKeyVaultSecret -VaultName $VaultName -Name $oldName -Enable $false | Out-Null
+            Write-Host "[OK]   '$oldName' disabled (not deleted — recoverable)." -ForegroundColor DarkYellow
+            $disableStatus = "DISABLED"
+        }
+        else {
+            Write-Host "[INFO] '$oldName' left enabled (DisableOldSecret = false)." -ForegroundColor Green
+            $disableStatus = "LEFT ENABLED"
+        }
+
+        $results += [PSCustomObject]@{
+            OldName        = $oldName
+            NewName        = $newName
+            OldSecretState = $disableStatus
+            Status         = "SUCCESS"
+        }
+    }
+    catch {
+        Write-Host "##vso[task.logissue type=error]Failed on '$oldName' → '$newName': $_" -ForegroundColor Red
+        $results += [PSCustomObject]@{
+            OldName        = $oldName
+            NewName        = $newName
+            OldSecretState = "N/A"
+            Status         = "FAILED: $_"
+        }
+        $hasError = $true
+    }
+}
+
+# ─────────────────────────────────────────────
+# 4. Print summary
+# ─────────────────────────────────────────────
+Write-Host "`n══════════════ SUMMARY ══════════════" -ForegroundColor Yellow
+$results | Format-Table -AutoSize | Out-String | Write-Host
+
+$skippedOrFailed = $results | Where-Object { $_.Status -notlike "SUCCESS*" }
+if ($skippedOrFailed.Count -gt 0) {
+    Write-Host "══════ ITEMS THAT NEED ATTENTION ════" -ForegroundColor Red
+    foreach ($item in $skippedOrFailed) {
+        Write-Host "  ► '$($item.OldName)' → '$($item.NewName)' : $($item.Status)" -ForegroundColor Yellow
+    }
+    Write-Host "##vso[task.logissue type=warning]One or more operations were skipped or failed. Review the summary above."
+}
+
+Write-Host "`n[DONE] Operation complete." -ForegroundColor Cyan
