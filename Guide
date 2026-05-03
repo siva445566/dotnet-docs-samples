@@ -1,0 +1,152 @@
+Act as a senior full-stack architect, product engineer, and DevOps expert.
+
+I want to build a production-ready web application for my shop.
+
+BUSINESS GOAL:
+I receive invoices/bills from suppliers and I want to digitally track all paid-out expenses automatically.
+
+CURRENT PROBLEMS:
+- Paper invoices get lost
+- Hard to remember how much I paid suppliers
+- Difficult to track monthly expenses
+- No centralized system
+
+SOLUTION:
+Build a web platform with QR-code-based invoice upload.
+
+WORKFLOW:
+1. Generate a QR code linked to an upload page.
+2. Print and place the QR code in my shop.
+3. When scanned using a mobile phone:
+   - Open upload page
+   - Allow invoice upload (image/pdf)
+4. Backend should:
+   - Store uploaded files
+   - Run OCR on invoices
+   - Extract:
+     * Supplier name
+     * Invoice number
+     * Amount
+     * Tax
+     * Invoice date
+5. Save all extracted data in database.
+6. Dashboard should show:
+   - Today’s paid out amount
+   - Weekly paid out amount
+   - Monthly paid out amount
+   - Supplier-wise spending
+   - Invoice search history
+   - Pending invoices
+   - Expense trends
+
+TECH STACK:
+
+Frontend:
+- Next.js
+- Tailwind CSS
+- Responsive design
+
+Pages:
+- Login
+- Dashboard
+- Upload Invoice
+- Supplier Management
+- Reports
+- Invoice Details
+
+Backend:
+Use FastAPI (Python)
+
+APIs:
+POST /upload-invoice
+GET /invoices
+GET /reports
+GET /suppliers
+POST /suppliers
+DELETE /invoice/{id}
+
+Database:
+Use PostgreSQL
+
+Database tables:
+
+suppliers:
+- id
+- name
+- phone
+- address
+- created_at
+
+invoices:
+- id
+- supplier_id
+- invoice_number
+- amount
+- tax
+- invoice_date
+- file_url
+- ocr_status
+- created_at
+
+Storage:
+- Azure Blob Storage
+
+OCR:
+- Azure Form Recognizer
+
+QR Upload URL:
+https://yourshop.com/upload
+
+Analytics:
+- Daily spending
+- Monthly spending
+- Supplier comparison
+
+Authentication:
+- OTP login
+- JWT authentication
+- Role-based access
+
+Security:
+- Encrypted storage
+- Audit logs
+- Daily backup
+
+DEVOPS REQUIREMENTS:
+
+Use:
+- Docker
+- Azure DevOps
+- Azure App Service
+
+CI/CD Pipeline:
+1. Build
+2. Unit Test
+3. Security Scan
+4. Docker Build
+5. Push Image
+6. Deploy to Azure
+7. Smoke Test
+
+Azure Infrastructure:
+- App Service
+- PostgreSQL
+- Blob Storage
+- Key Vault
+- Application Insights
+- Monitoring and Logging
+
+I need:
+
+1. Complete architecture design
+2. Project folder structure
+3. Database schema
+4. API design
+5. UI wireframes
+6. Azure architecture diagram
+7. Dockerfiles
+8. Azure DevOps YAML pipeline
+9. Production deployment strategy
+10. MVP roadmap
+
+Generate production-quality implementation with code examples.
