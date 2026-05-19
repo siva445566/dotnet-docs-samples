@@ -1,0 +1,444 @@
+# ============================================================
+# Azure Firewall IP Whitelisting Pipeline Script
+# Supports: Storage Account | Key Vault | SQL Server
+# ============================================================
+
+[CmdletBinding()]
+param(
+    # --- Pipeline Variables (passed from Variable Group) ---
+    [Parameter(Mandatory=$true)]
+    [ValidateSet("dev","uat","prod")]
+    [string]$Environment,
+
+    [Parameter(Mandatory=$true)]
+    [ValidateSet("storage","keyvault","sql")]
+    [string]$ResourceType,
+
+    # --- IP Input ---
+    # For Storage/KeyVault: Single IP like "10.0.0.1" or CIDR like "10.0.0.0/24"
+    # For SQL: Provide StartIP and EndIP separately
+    [Parameter(Mandatory=$false)]
+    [string]$IPAddress = "",          # Used for Storage & KeyVault (single IP or CIDR)
+
+    [Parameter(Mandatory=$false)]
+    [string]$CIDRSuffix = "",         # Optional: /32 or /26 etc. Ignored if IPAddress already has CIDR
+
+    [Parameter(Mandatory=$false)]
+    [string]$SQLStartIP = "",         # Used only for SQL
+
+    [Parameter(Mandatory=$false)]
+    [string]$SQLEndIP = "",           # Used only for SQL
+
+    [Parameter(Mandatory=$false)]
+    [string]$FirewallRuleName = "",   # Optional: custom rule name; auto-generated if empty
+
+    # --- Azure Auth (Service Connection via pipeline env vars) ---
+    [Parameter(Mandatory=$false)]
+    [string]$SubscriptionId = $env:ARM_SUBSCRIPTION_ID,
+
+    [Parameter(Mandatory=$false)]
+    [string]$TenantId = $env:ARM_TENANT_ID
+)
+
+# ============================================================
+# SECTION 1: Resource Name Mapping from Variable Groups
+# These variables come from your Azure DevOps Variable Groups:
+#   - VG-DEV, VG-UAT, VG-PROD
+# Map them here based on environment selection
+# ============================================================
+
+function Get-EnvironmentResources {
+    param([string]$Env)
+
+    switch ($Env.ToLower()) {
+        "dev" {
+            return @{
+                ResourceGroupName    = $env:DEV_RESOURCE_GROUP         # e.g., "rg-myapp-dev"
+                StorageAccountName   = $env:DEV_STORAGE_ACCOUNT_NAME   # e.g., "stmyappdev"
+                KeyVaultName         = $env:DEV_KEYVAULT_NAME           # e.g., "kv-myapp-dev"
+                SQLServerName        = $env:DEV_SQL_SERVER_NAME         # e.g., "sql-myapp-dev"
+            }
+        }
+        "uat" {
+            return @{
+                ResourceGroupName    = $env:UAT_RESOURCE_GROUP
+                StorageAccountName   = $env:UAT_STORAGE_ACCOUNT_NAME
+                KeyVaultName         = $env:UAT_KEYVAULT_NAME
+                SQLServerName        = $env:UAT_SQL_SERVER_NAME
+            }
+        }
+        "prod" {
+            return @{
+                ResourceGroupName    = $env:PROD_RESOURCE_GROUP
+                StorageAccountName   = $env:PROD_STORAGE_ACCOUNT_NAME
+                KeyVaultName         = $env:PROD_KEYVAULT_NAME
+                SQLServerName        = $env:PROD_SQL_SERVER_NAME
+            }
+        }
+        default {
+            throw "Unknown environment: $Env. Must be dev, uat, or prod."
+        }
+    }
+}
+
+# ============================================================
+# SECTION 2: Module Check & Install
+# ============================================================
+
+function Ensure-AzModules {
+    Write-Host "`n[MODULE CHECK] Verifying required Az modules..." -ForegroundColor Cyan
+
+    $requiredModules = @("Az.Accounts", "Az.Storage", "Az.KeyVault", "Az.Sql")
+
+    foreach ($module in $requiredModules) {
+        $installed = Get-Module -ListAvailable -Name $module | Sort-Object Version -Descending | Select-Object -First 1
+
+        if ($null -eq $installed) {
+            Write-Host "  [INSTALL] $module not found. Installing..." -ForegroundColor Yellow
+            try {
+                Install-Module -Name $module -Force -AllowClobber -Scope CurrentUser -Repository PSGallery -ErrorAction Stop
+                Write-Host "  [OK] $module installed successfully." -ForegroundColor Green
+            } catch {
+                Write-Error "  [FAIL] Could not install $module. Error: $_"
+                exit 1
+            }
+        } else {
+            Write-Host "  [OK] $module found (v$($installed.Version))." -ForegroundColor Green
+        }
+
+        Import-Module $module -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "[MODULE CHECK] All modules ready.`n" -ForegroundColor Green
+}
+
+# ============================================================
+# SECTION 3: Azure Login
+# Uses Service Principal from pipeline service connection env vars
+# ============================================================
+
+function Connect-ToAzure {
+    param([string]$SubId, [string]$TenId)
+
+    Write-Host "[AUTH] Connecting to Azure..." -ForegroundColor Cyan
+
+    # If running in Azure DevOps with AzureCLI/AzurePowerShell task,
+    # connection is already established. This handles both cases.
+    $context = Get-AzContext -ErrorAction SilentlyContinue
+
+    if ($null -eq $context -or $context.Subscription.Id -ne $SubId) {
+        $clientId     = $env:ARM_CLIENT_ID
+        $clientSecret = $env:ARM_CLIENT_SECRET
+
+        if (-not $clientId -or -not $clientSecret) {
+            Write-Warning "[AUTH] ARM_CLIENT_ID/ARM_CLIENT_SECRET not set. Attempting existing context..."
+        } else {
+            $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+            $credential   = New-Object System.Management.Automation.PSCredential($clientId, $secureSecret)
+
+            Connect-AzAccount -ServicePrincipal -Credential $credential -Tenant $TenId -ErrorAction Stop | Out-Null
+        }
+
+        if ($SubId) {
+            Set-AzContext -SubscriptionId $SubId -ErrorAction Stop | Out-Null
+        }
+    }
+
+    $ctx = Get-AzContext
+    Write-Host "[AUTH] Connected. Subscription: $($ctx.Subscription.Name) ($($ctx.Subscription.Id))" -ForegroundColor Green
+}
+
+# ============================================================
+# SECTION 4: IP / CIDR Helpers
+# ============================================================
+
+function Resolve-IPWithCIDR {
+    param(
+        [string]$IP,
+        [string]$Suffix
+    )
+
+    # If IP already contains CIDR notation, use as-is
+    if ($IP -match "/\d+$") {
+        return $IP
+    }
+
+    # If suffix provided, append it
+    if ($Suffix -ne "") {
+        $cleanSuffix = $Suffix.TrimStart("/")
+        return "$IP/$cleanSuffix"
+    }
+
+    # Default: /32 (single host)
+    Write-Host "  [INFO] No CIDR suffix provided. Defaulting to /32 (single host)." -ForegroundColor Yellow
+    return "$IP/32"
+}
+
+function Validate-IPv4 {
+    param([string]$IP)
+    # Strip CIDR if present for base IP validation
+    $baseIP = ($IP -split "/")[0]
+    return ($baseIP -match "^(\d{1,3}\.){3}\d{1,3}$")
+}
+
+function Generate-RuleName {
+    param([string]$IP, [string]$Type)
+    $sanitized = $IP -replace "[./]", "-"
+    $timestamp  = Get-Date -Format "yyyyMMdd-HHmm"
+    return "fw-rule-$Type-$sanitized-$timestamp"
+}
+
+# ============================================================
+# SECTION 5: Storage Account Firewall
+# ============================================================
+
+function Add-StorageFirewallRule {
+    param(
+        [string]$ResourceGroup,
+        [string]$StorageName,
+        [string]$CIDRAddress
+    )
+
+    Write-Host "`n[STORAGE] Adding IP rule to Storage Account: $StorageName" -ForegroundColor Cyan
+    Write-Host "  Resource Group : $ResourceGroup"
+    Write-Host "  CIDR Address   : $CIDRAddress"
+
+    try {
+        # Verify storage account exists
+        $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $StorageName -ErrorAction Stop
+        Write-Host "  [OK] Storage account found: $($sa.StorageAccountName)"
+
+        # Check if rule already exists
+        $existingRules = $sa.NetworkRuleSet.IpRules | Where-Object { $_.IPAddressOrRange -eq $CIDRAddress }
+        if ($existingRules) {
+            Write-Host "  [SKIP] Rule for $CIDRAddress already exists on Storage Account." -ForegroundColor Yellow
+            return
+        }
+
+        # Add the IP rule
+        Add-AzStorageAccountNetworkRule `
+            -ResourceGroupName $ResourceGroup `
+            -Name $StorageName `
+            -IPAddressOrRange $CIDRAddress `
+            -ErrorAction Stop
+
+        Write-Host "  [SUCCESS] IP $CIDRAddress added to Storage Account firewall." -ForegroundColor Green
+
+        # Verify
+        $updated = Get-AzStorageAccount -ResourceGroupName $ResourceGroup -Name $StorageName
+        $addedRule = $updated.NetworkRuleSet.IpRules | Where-Object { $_.IPAddressOrRange -eq $CIDRAddress }
+        if ($addedRule) {
+            Write-Host "  [VERIFIED] Rule confirmed in network ruleset." -ForegroundColor Green
+        }
+
+    } catch {
+        Write-Error "[STORAGE ERROR] $_"
+        exit 1
+    }
+}
+
+# ============================================================
+# SECTION 6: Key Vault Firewall
+# ============================================================
+
+function Add-KeyVaultFirewallRule {
+    param(
+        [string]$ResourceGroup,
+        [string]$VaultName,
+        [string]$CIDRAddress
+    )
+
+    Write-Host "`n[KEYVAULT] Adding IP rule to Key Vault: $VaultName" -ForegroundColor Cyan
+    Write-Host "  Resource Group : $ResourceGroup"
+    Write-Host "  CIDR Address   : $CIDRAddress"
+
+    try {
+        # Verify Key Vault exists
+        $kv = Get-AzKeyVault -ResourceGroupName $ResourceGroup -VaultName $VaultName -ErrorAction Stop
+        Write-Host "  [OK] Key Vault found: $($kv.VaultName)"
+
+        # Check existing rules
+        $existingRules = $kv.NetworkAcls.IpAddressRanges | Where-Object { $_ -eq $CIDRAddress }
+        if ($existingRules) {
+            Write-Host "  [SKIP] Rule for $CIDRAddress already exists on Key Vault." -ForegroundColor Yellow
+            return
+        }
+
+        # Add IP rule
+        Add-AzKeyVaultNetworkRule `
+            -ResourceGroupName $ResourceGroup `
+            -VaultName $VaultName `
+            -IpAddressRange $CIDRAddress `
+            -ErrorAction Stop
+
+        Write-Host "  [SUCCESS] IP $CIDRAddress added to Key Vault firewall." -ForegroundColor Green
+
+        # Verify
+        $updated = Get-AzKeyVault -ResourceGroupName $ResourceGroup -VaultName $VaultName
+        $addedRule = $updated.NetworkAcls.IpAddressRanges | Where-Object { $_ -eq $CIDRAddress }
+        if ($addedRule) {
+            Write-Host "  [VERIFIED] Rule confirmed in Key Vault network ACL." -ForegroundColor Green
+        }
+
+    } catch {
+        Write-Error "[KEYVAULT ERROR] $_"
+        exit 1
+    }
+}
+
+# ============================================================
+# SECTION 7: SQL Server Firewall
+# ============================================================
+
+function Add-SQLFirewallRule {
+    param(
+        [string]$ResourceGroup,
+        [string]$SQLServer,
+        [string]$StartIP,
+        [string]$EndIP,
+        [string]$RuleName
+    )
+
+    Write-Host "`n[SQL] Adding firewall rule to SQL Server: $SQLServer" -ForegroundColor Cyan
+    Write-Host "  Resource Group : $ResourceGroup"
+    Write-Host "  Start IP       : $StartIP"
+    Write-Host "  End IP         : $EndIP"
+    Write-Host "  Rule Name      : $RuleName"
+
+    try {
+        # Verify SQL Server exists
+        $sql = Get-AzSqlServer -ResourceGroupName $ResourceGroup -ServerName $SQLServer -ErrorAction Stop
+        Write-Host "  [OK] SQL Server found: $($sql.ServerName)"
+
+        # Check if rule name already exists
+        $existingRule = Get-AzSqlServerFirewallRule `
+            -ResourceGroupName $ResourceGroup `
+            -ServerName $SQLServer `
+            -FirewallRuleName $RuleName `
+            -ErrorAction SilentlyContinue
+
+        if ($existingRule) {
+            Write-Host "  [UPDATE] Rule '$RuleName' exists. Updating IP range..." -ForegroundColor Yellow
+            Set-AzSqlServerFirewallRule `
+                -ResourceGroupName $ResourceGroup `
+                -ServerName $SQLServer `
+                -FirewallRuleName $RuleName `
+                -StartIpAddress $StartIP `
+                -EndIpAddress $EndIP `
+                -ErrorAction Stop
+            Write-Host "  [SUCCESS] SQL firewall rule updated." -ForegroundColor Green
+        } else {
+            New-AzSqlServerFirewallRule `
+                -ResourceGroupName $ResourceGroup `
+                -ServerName $SQLServer `
+                -FirewallRuleName $RuleName `
+                -StartIpAddress $StartIP `
+                -EndIpAddress $EndIP `
+                -ErrorAction Stop
+            Write-Host "  [SUCCESS] SQL firewall rule created." -ForegroundColor Green
+        }
+
+        # Verify
+        $rule = Get-AzSqlServerFirewallRule `
+            -ResourceGroupName $ResourceGroup `
+            -ServerName $SQLServer `
+            -FirewallRuleName $RuleName
+        Write-Host "  [VERIFIED] Rule: $($rule.FirewallRuleName) | $($rule.StartIpAddress) -> $($rule.EndIpAddress)" -ForegroundColor Green
+
+    } catch {
+        Write-Error "[SQL ERROR] $_"
+        exit 1
+    }
+}
+
+# ============================================================
+# SECTION 8: MAIN EXECUTION
+# ============================================================
+
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host " Azure Firewall IP Whitelisting Script" -ForegroundColor Magenta
+Write-Host " Environment  : $Environment" -ForegroundColor Magenta
+Write-Host " Resource Type: $ResourceType" -ForegroundColor Magenta
+Write-Host "============================================================`n" -ForegroundColor Magenta
+
+# Step 1: Module check
+Ensure-AzModules
+
+# Step 2: Connect to Azure
+Connect-ToAzure -SubId $SubscriptionId -TenId $TenantId
+
+# Step 3: Load environment-specific resource names
+$resources = Get-EnvironmentResources -Env $Environment
+Write-Host "[CONFIG] Resource Group  : $($resources.ResourceGroupName)"
+Write-Host "[CONFIG] Storage Account : $($resources.StorageAccountName)"
+Write-Host "[CONFIG] Key Vault       : $($resources.KeyVaultName)"
+Write-Host "[CONFIG] SQL Server      : $($resources.SQLServerName)`n"
+
+# Step 4: Execute based on ResourceType
+switch ($ResourceType.ToLower()) {
+
+    "storage" {
+        if (-not $IPAddress) {
+            Write-Error "[INPUT ERROR] IPAddress parameter is required for Storage Account."
+            exit 1
+        }
+        if (-not (Validate-IPv4 -IP $IPAddress)) {
+            Write-Error "[INPUT ERROR] IPAddress '$IPAddress' is not a valid IPv4 address."
+            exit 1
+        }
+        $cidr = Resolve-IPWithCIDR -IP $IPAddress -Suffix $CIDRSuffix
+        Add-StorageFirewallRule `
+            -ResourceGroup $resources.ResourceGroupName `
+            -StorageName $resources.StorageAccountName `
+            -CIDRAddress $cidr
+    }
+
+    "keyvault" {
+        if (-not $IPAddress) {
+            Write-Error "[INPUT ERROR] IPAddress parameter is required for Key Vault."
+            exit 1
+        }
+        if (-not (Validate-IPv4 -IP $IPAddress)) {
+            Write-Error "[INPUT ERROR] IPAddress '$IPAddress' is not a valid IPv4 address."
+            exit 1
+        }
+        $cidr = Resolve-IPWithCIDR -IP $IPAddress -Suffix $CIDRSuffix
+        Add-KeyVaultFirewallRule `
+            -ResourceGroup $resources.ResourceGroupName `
+            -VaultName $resources.KeyVaultName `
+            -CIDRAddress $cidr
+    }
+
+    "sql" {
+        if (-not $SQLStartIP -or -not $SQLEndIP) {
+            Write-Error "[INPUT ERROR] SQLStartIP and SQLEndIP are both required for SQL Server."
+            Write-Host "  Hint: For a single IP, set both SQLStartIP and SQLEndIP to the same value." -ForegroundColor Yellow
+            exit 1
+        }
+        if (-not (Validate-IPv4 -IP $SQLStartIP) -or -not (Validate-IPv4 -IP $SQLEndIP)) {
+            Write-Error "[INPUT ERROR] SQLStartIP or SQLEndIP is not a valid IPv4 address."
+            exit 1
+        }
+
+        # Auto-generate rule name if not provided
+        if (-not $FirewallRuleName) {
+            $FirewallRuleName = Generate-RuleName -IP $SQLStartIP -Type "sql"
+        }
+
+        Add-SQLFirewallRule `
+            -ResourceGroup $resources.ResourceGroupName `
+            -SQLServer $resources.SQLServerName `
+            -StartIP $SQLStartIP `
+            -EndIP $SQLEndIP `
+            -RuleName $FirewallRuleName
+    }
+
+    default {
+        Write-Error "[INPUT ERROR] Unknown ResourceType: $ResourceType. Use: storage, keyvault, or sql"
+        exit 1
+    }
+}
+
+Write-Host "`n============================================================" -ForegroundColor Green
+Write-Host " COMPLETED SUCCESSFULLY" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
