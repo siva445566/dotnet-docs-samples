@@ -1,0 +1,115 @@
+# azure-pipelines-firewall.yml
+
+trigger: none  # Manual trigger only
+
+parameters:
+  - name: Environment
+    displayName: "Target Environment"
+    type: string
+    default: dev
+    values:
+      - dev
+      - uat
+      - prod
+
+  - name: ResourceType
+    displayName: "Resource Type"
+    type: string
+    default: storage
+    values:
+      - storage
+      - keyvault
+      - sql
+
+  # --- For Storage & Key Vault ---
+  - name: IPAddress
+    displayName: "IP Address (Storage/KeyVault) e.g. 10.0.0.1 or 10.0.0.0/24"
+    type: string
+    default: ""
+
+  - name: CIDRSuffix
+    displayName: "CIDR Suffix (Storage/KeyVault) e.g. 32 or 26. Leave blank for /32 default"
+    type: string
+    default: ""
+
+  # --- For SQL Only ---
+  - name: SQLStartIP
+    displayName: "SQL Start IP (SQL only) e.g. 10.0.0.1"
+    type: string
+    default: ""
+
+  - name: SQLEndIP
+    displayName: "SQL End IP (SQL only) e.g. 10.0.0.255"
+    type: string
+    default: ""
+
+  - name: FirewallRuleName
+    displayName: "Firewall Rule Name (SQL only, optional)"
+    type: string
+    default: ""
+
+# -------------------------------------------------------
+# Variable Groups — define these in Library:
+#   VG-DEV  → DEV_RESOURCE_GROUP, DEV_STORAGE_ACCOUNT_NAME, etc.
+#   VG-UAT  → UAT_RESOURCE_GROUP, etc.
+#   VG-PROD → PROD_RESOURCE_GROUP, etc.
+#   VG-AZURE-AUTH → ARM_SUBSCRIPTION_ID, ARM_TENANT_ID,
+#                   ARM_CLIENT_ID, ARM_CLIENT_SECRET
+# -------------------------------------------------------
+variables:
+  - ${{ if eq(parameters.Environment, 'dev') }}:
+    - group: VG-DEV
+  - ${{ if eq(parameters.Environment, 'uat') }}:
+    - group: VG-UAT
+  - ${{ if eq(parameters.Environment, 'prod') }}:
+    - group: VG-PROD
+  - group: VG-AZURE-AUTH
+
+stages:
+  - stage: FirewallUpdate
+    displayName: "Update Azure Firewall Rules"
+    jobs:
+      - job: AddFirewallRule
+        displayName: "Add IP to ${{ parameters.ResourceType }} (${{ parameters.Environment }})"
+        pool:
+          vmImage: "windows-latest"   # PowerShell Az module works best on windows agent
+                                       # Change to ubuntu-latest if using pwsh on Linux
+
+        steps:
+          - checkout: none
+
+          - task: PowerShell@2
+            displayName: "Run Firewall IP Whitelisting Script"
+            inputs:
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/Add-FirewallIPRule.ps1"
+              arguments: >
+                -Environment "${{ parameters.Environment }}"
+                -ResourceType "${{ parameters.ResourceType }}"
+                -IPAddress "${{ parameters.IPAddress }}"
+                -CIDRSuffix "${{ parameters.CIDRSuffix }}"
+                -SQLStartIP "${{ parameters.SQLStartIP }}"
+                -SQLEndIP "${{ parameters.SQLEndIP }}"
+                -FirewallRuleName "${{ parameters.FirewallRuleName }}"
+                -SubscriptionId "$(ARM_SUBSCRIPTION_ID)"
+                -TenantId "$(ARM_TENANT_ID)"
+              pwsh: true
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+              # DEV vars (populated from VG-DEV if env=dev)
+              DEV_RESOURCE_GROUP: $(DEV_RESOURCE_GROUP)
+              DEV_STORAGE_ACCOUNT_NAME: $(DEV_STORAGE_ACCOUNT_NAME)
+              DEV_KEYVAULT_NAME: $(DEV_KEYVAULT_NAME)
+              DEV_SQL_SERVER_NAME: $(DEV_SQL_SERVER_NAME)
+              # UAT vars
+              UAT_RESOURCE_GROUP: $(UAT_RESOURCE_GROUP)
+              UAT_STORAGE_ACCOUNT_NAME: $(UAT_STORAGE_ACCOUNT_NAME)
+              UAT_KEYVAULT_NAME: $(UAT_KEYVAULT_NAME)
+              UAT_SQL_SERVER_NAME: $(UAT_SQL_SERVER_NAME)
+              # PROD vars
+              PROD_RESOURCE_GROUP: $(PROD_RESOURCE_GROUP)
+              PROD_STORAGE_ACCOUNT_NAME: $(PROD_STORAGE_ACCOUNT_NAME)
+              PROD_KEYVAULT_NAME: $(PROD_KEYVAULT_NAME)
+              PROD_SQL_SERVER_NAME: $(PROD_SQL_SERVER_NAME)
