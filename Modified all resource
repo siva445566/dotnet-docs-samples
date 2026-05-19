@@ -1,89 +1,76 @@
 param(
-   [Parameter(Mandatory=$true)][ValidateSet("dev","uat","prod")][string]$Environment,
-   [Parameter(Mandatory=$true)][ValidateSet("storage","keyvault","sql")][string]$ResourceType,
-   [string]$IPAddress   = "",
-   [string]$CIDRSuffix  = "",
-   [string]$SQLStartIP  = "",
-   [string]$SQLEndIP    = "",
-   [string]$RuleName    = ""
+   [Parameter(Mandatory=$true)]
+   [ValidateSet("storage","keyvault","sql")]
+   [string]$ResourceType,
+
+   # Storage / KeyVault
+   [string]$ResourceName = "",
+   [string]$IPAddress    = "",
+
+   # SQL only
+   [string]$SQLServerName = "",
+   [string]$StartIP       = "",
+   [string]$EndIP         = ""
 )
 
-# ---- Resource Map from Variable Group env vars ----
-$r = @{
-   RG      = (Get-Variable "${Environment}_RESOURCE_GROUP"         -ValueOnly -ErrorAction SilentlyContinue) ?? $env:("${Environment}_RESOURCE_GROUP".ToUpper())
-   Storage = [System.Environment]::GetEnvironmentVariable("${Environment}_STORAGE_ACCOUNT_NAME".ToUpper())
-   KV      = [System.Environment]::GetEnvironmentVariable("${Environment}_KEYVAULT_NAME".ToUpper())
-   SQL     = [System.Environment]::GetEnvironmentVariable("${Environment}_SQL_SERVER_NAME".ToUpper())
+# ---- IP Validation (no CIDR) ----
+function Validate-IP($ip) {
+   return $ip -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
 }
 
-# Cleaner env var reader
-function Env($key) { [System.Environment]::GetEnvironmentVariable($key.ToUpper()) }
-
-$RG      = Env "${Environment}_RESOURCE_GROUP"
-$Storage = Env "${Environment}_STORAGE_ACCOUNT_NAME"
-$KV      = Env "${Environment}_KEYVAULT_NAME"
-$SQL     = Env "${Environment}_SQL_SERVER_NAME"
-
-Write-Host "Environment: $Environment | Resource: $ResourceType | RG: $RG" -ForegroundColor Cyan
-
-# ---- CIDR Helper ----
-function Get-CIDR($ip, $suffix) {
+# ---- Ensure /32 if no CIDR given ----
+function Get-CIDR($ip) {
    if ($ip -match "/\d+$") { return $ip }
-   if ($suffix)             { return "$ip/$($suffix.TrimStart('/'))" }
    Write-Host "No CIDR provided, defaulting to /32" -ForegroundColor Yellow
    return "$ip/32"
 }
 
-# ---- Auto rule name for SQL ----
-function New-RuleName($ip) {
-   "fw-$(($ip -replace '[./]','-'))-$(Get-Date -Format 'yyyyMMdd-HHmm')"
-}
-
-# ---- MAIN ----
 switch ($ResourceType.ToLower()) {
 
    "storage" {
-       if (-not $IPAddress) { Write-Error "IPAddress required for Storage"; exit 1 }
-       $cidr = Get-CIDR $IPAddress $CIDRSuffix
-       Write-Host "Adding $cidr to Storage: $Storage"
+       if (-not $ResourceName) { Write-Error "ResourceName (Storage Account name) is required."; exit 1 }
+       if (-not $IPAddress)    { Write-Error "IPAddress is required."; exit 1 }
+       if (-not (Validate-IP ($IPAddress -split "/")[0])) { Write-Error "Invalid IP: $IPAddress"; exit 1 }
 
-       $existing = (Get-AzStorageAccount -ResourceGroupName $RG -Name $Storage).NetworkRuleSet.IpRules
-       if ($existing.IPAddressOrRange -contains $cidr) {
-           Write-Host "Rule already exists. Skipping." -ForegroundColor Yellow; exit 0
-       }
-       Add-AzStorageAccountNetworkRule -ResourceGroupName $RG -Name $Storage -IPAddressOrRange $cidr
-       Write-Host "Done." -ForegroundColor Green
+       $cidr = Get-CIDR $IPAddress
+       $rg   = (Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $ResourceName }).ResourceGroupName
+       if (-not $rg) { Write-Error "Storage Account '$ResourceName' not found."; exit 1 }
+
+       $existing = (Get-AzStorageAccount -ResourceGroupName $rg -Name $ResourceName).NetworkRuleSet.IpRules.IPAddressOrRange
+       if ($existing -contains $cidr) { Write-Host "Rule $cidr already exists. Skipping." -ForegroundColor Yellow; exit 0 }
+
+       Add-AzStorageAccountNetworkRule -ResourceGroupName $rg -Name $ResourceName -IPAddressOrRange $cidr
+       Write-Host "Added $cidr to Storage Account: $ResourceName" -ForegroundColor Green
    }
 
    "keyvault" {
-       if (-not $IPAddress) { Write-Error "IPAddress required for KeyVault"; exit 1 }
-       $cidr = Get-CIDR $IPAddress $CIDRSuffix
-       Write-Host "Adding $cidr to KeyVault: $KV"
+       if (-not $ResourceName) { Write-Error "ResourceName (Key Vault name) is required."; exit 1 }
+       if (-not $IPAddress)    { Write-Error "IPAddress is required."; exit 1 }
+       if (-not (Validate-IP ($IPAddress -split "/")[0])) { Write-Error "Invalid IP: $IPAddress"; exit 1 }
 
-       $existing = (Get-AzKeyVault -ResourceGroupName $RG -VaultName $KV).NetworkAcls.IpAddressRanges
-       if ($existing -contains $cidr) {
-           Write-Host "Rule already exists. Skipping." -ForegroundColor Yellow; exit 0
-       }
-       Add-AzKeyVaultNetworkRule -ResourceGroupName $RG -VaultName $KV -IpAddressRange $cidr
-       Write-Host "Done." -ForegroundColor Green
+       $cidr = Get-CIDR $IPAddress
+       $rg   = (Get-AzKeyVault -VaultName $ResourceName).ResourceGroupName
+       if (-not $rg) { Write-Error "Key Vault '$ResourceName' not found."; exit 1 }
+
+       $existing = (Get-AzKeyVault -ResourceGroupName $rg -VaultName $ResourceName).NetworkAcls.IpAddressRanges
+       if ($existing -contains $cidr) { Write-Host "Rule $cidr already exists. Skipping." -ForegroundColor Yellow; exit 0 }
+
+       Add-AzKeyVaultNetworkRule -ResourceGroupName $rg -VaultName $ResourceName -IpAddressRange $cidr
+       Write-Host "Added $cidr to Key Vault: $ResourceName" -ForegroundColor Green
    }
 
    "sql" {
-       if (-not $SQLStartIP -or -not $SQLEndIP) {
-           Write-Error "SQLStartIP and SQLEndIP both required for SQL"; exit 1
-       }
-       if (-not $RuleName) { $RuleName = New-RuleName $SQLStartIP }
-       Write-Host "Adding rule '$RuleName' [$SQLStartIP -> $SQLEndIP] to SQL: $SQL"
+       if (-not $SQLServerName) { Write-Error "SQLServerName is required."; exit 1 }
+       if (-not $StartIP)       { Write-Error "StartIP is required."; exit 1 }
+       if (-not $EndIP)         { Write-Error "EndIP is required."; exit 1 }
+       if (-not (Validate-IP $StartIP)) { Write-Error "Invalid StartIP: $StartIP"; exit 1 }
+       if (-not (Validate-IP $EndIP))   { Write-Error "Invalid EndIP: $EndIP"; exit 1 }
 
-       $exists = Get-AzSqlServerFirewallRule -ResourceGroupName $RG -ServerName $SQL -FirewallRuleName $RuleName -ErrorAction SilentlyContinue
-       if ($exists) {
-           Set-AzSqlServerFirewallRule -ResourceGroupName $RG -ServerName $SQL -FirewallRuleName $RuleName -StartIpAddress $SQLStartIP -EndIpAddress $SQLEndIP
-           Write-Host "Rule updated." -ForegroundColor Green
-       } else {
-           New-AzSqlServerFirewallRule -ResourceGroupName $RG -ServerName $SQL -FirewallRuleName $RuleName -StartIpAddress $SQLStartIP -EndIpAddress $SQLEndIP
-           Write-Host "Rule created." -ForegroundColor Green
-       }
+       $rg      = (Get-AzSqlServer | Where-Object { $_.ServerName -eq $SQLServerName }).ResourceGroupName
+       if (-not $rg) { Write-Error "SQL Server '$SQLServerName' not found."; exit 1 }
+
+       $ruleName = "fw-$(($StartIP -replace '\.','-'))-$(Get-Date -Format 'yyyyMMddHHmm')"
+       New-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName -FirewallRuleName $ruleName -StartIpAddress $StartIP -EndIpAddress $EndIP
+       Write-Host "Added SQL rule [$StartIP -> $EndIP] to: $SQLServerName" -ForegroundColor Green
    }
-
-   default { Write-Error "Invalid ResourceType. Use: storage, keyvault, sql"; exit 1 }
 }
