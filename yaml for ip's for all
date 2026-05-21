@@ -1,0 +1,108 @@
+parameters:
+  - name: AddStorage
+    displayName: "Storage Account"
+    type: boolean
+    default: false
+
+  - name: AddKeyVault
+    displayName: "Key Vault"
+    type: boolean
+    default: false
+
+  - name: AddSQL
+    displayName: "SQL Server"
+    type: boolean
+    default: false
+
+  - name: ResourceName
+    displayName: "Resource Name (Storage or KeyVault)"
+    type: string
+    default: " "
+
+  - name: IPAddresses
+    displayName: "IP Addresses — comma separated e.g. 10.0.0.1,10.0.0.2/26"
+    type: string
+    default: " "
+
+  - name: SQLServerNames
+    displayName: "SQL Server Names — comma separated e.g. sql1,sql2,sql3"
+    type: string
+    default: " "
+
+  - name: RuleNames
+    displayName: "Rule Names — comma separated e.g. rule1,rule2,rule3"
+    type: string
+    default: " "
+
+  - name: StartIPs
+    displayName: "Start IPs — comma separated e.g. 10.0.0.1,10.0.0.10"
+    type: string
+    default: " "
+
+  - name: EndIPs
+    displayName: "End IPs — comma separated e.g. 10.0.0.5,10.0.0.15"
+    type: string
+    default: " "
+
+trigger: none
+
+stages:
+  - stage: FirewallUpdate
+    displayName: "Update Firewall Rules"
+    jobs:
+
+      # ---- Storage Job ----
+      - ${{ if eq(parameters.AddStorage, true) }}:
+        - job: StorageFirewall
+          displayName: "Storage Account - Add IPs"
+          pool:
+            vmImage: "windows-latest"
+          steps:
+            - checkout: none
+            - task: PowerShell@2
+              displayName: "Add IPs to Storage Account"
+              inputs:
+                filePath: "$(System.DefaultWorkingDirectory)/scripts/Add-FirewallIPRule.ps1"
+                arguments: >
+                  -ResourceType "storage"
+                  -ResourceName "${{ parameters.ResourceName }}"
+                  -IPAddresses "${{ parameters.IPAddresses }}"
+                pwsh: true
+
+      # ---- KeyVault Job ----
+      - ${{ if eq(parameters.AddKeyVault, true) }}:
+        - job: KeyVaultFirewall
+          displayName: "Key Vault - Add IPs"
+          pool:
+            vmImage: "windows-latest"
+          steps:
+            - checkout: none
+            - task: PowerShell@2
+              displayName: "Add IPs to Key Vault"
+              inputs:
+                filePath: "$(System.DefaultWorkingDirectory)/scripts/Add-FirewallIPRule.ps1"
+                arguments: >
+                  -ResourceType "keyvault"
+                  -ResourceName "${{ parameters.ResourceName }}"
+                  -IPAddresses "${{ parameters.IPAddresses }}"
+                pwsh: true
+
+      # ---- SQL Job ----
+      - ${{ if eq(parameters.AddSQL, true) }}:
+        - job: SQLFirewall
+          displayName: "SQL Server - Add Firewall Rules"
+          pool:
+            vmImage: "windows-latest"
+          steps:
+            - checkout: none
+            - task: PowerShell@2
+              displayName: "Add Firewall Rules to SQL Server"
+              inputs:
+                filePath: "$(System.DefaultWorkingDirectory)/scripts/Add-FirewallIPRule.ps1"
+                arguments: >
+                  -ResourceType "sql"
+                  -SQLServerNames "${{ parameters.SQLServerNames }}"
+                  -RuleNames "${{ parameters.RuleNames }}"
+                  -StartIPs "${{ parameters.StartIPs }}"
+                  -EndIPs "${{ parameters.EndIPs }}"
+                pwsh: true
