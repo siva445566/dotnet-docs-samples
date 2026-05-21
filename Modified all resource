@@ -3,23 +3,27 @@ param(
     [ValidateSet("storage","keyvault","sql")]
     [string]$ResourceType,
 
-    # Storage / KeyVault — comma separated values
-    [string]$ResourceName = "",   # e.g. "mystorage1,mystorage2"
-    [string]$IPAddresses  = "",   # e.g. "10.0.0.1,10.0.0.2/26,10.0.0.3"
-
-    # SQL only — comma separated values
-    [string]$SQLServerNames = "",  # e.g. "sql1,sql2,sql3"
-    [string]$RuleNames      = "",  # e.g. "rule1,rule2,rule3"
-    [string]$StartIPs       = "",  # e.g. "10.0.0.1,10.0.0.10,10.0.0.20"
-    [string]$EndIPs         = ""   # e.g. "10.0.0.5,10.0.0.15,10.0.0.25"
+    [string]$ResourceName   = " ",
+    [string]$IPAddresses    = " ",
+    [string]$SQLServerNames = " ",
+    [string]$RuleNames      = " ",
+    [string]$StartIPs       = " ",
+    [string]$EndIPs         = " "
 )
 
-# ---- IP Validation ----
+# Trim all inputs
+$ResourceName   = $ResourceName.Trim()
+$IPAddresses    = $IPAddresses.Trim()
+$SQLServerNames = $SQLServerNames.Trim()
+$RuleNames      = $RuleNames.Trim()
+$StartIPs       = $StartIPs.Trim()
+$EndIPs         = $EndIPs.Trim()
+
+# ---- Helpers ----
 function Validate-IP($ip) {
     return $ip -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
 }
 
-# ---- CIDR Helper ----
 function Get-CIDR($ip) {
     $ip = $ip.Trim()
     if ($ip -match "/\d+$") { return $ip }
@@ -27,137 +31,160 @@ function Get-CIDR($ip) {
     return "$ip/32"
 }
 
-# ==============================
+Write-Host ""
+Write-Host "======================================" -ForegroundColor Magenta
+Write-Host " Resource Type : $ResourceType"         -ForegroundColor Magenta
+Write-Host "======================================" -ForegroundColor Magenta
+
 switch ($ResourceType.ToLower()) {
 
-# ==============================
+# ==============================================================
     "storage" {
-        if (-not $ResourceName) { Write-Error "ResourceName is required."; exit 1 }
-        if (-not $IPAddresses)  { Write-Error "IPAddresses is required."; exit 1 }
+        if (-not $ResourceName) { Write-Error "ResourceName is required for Storage."; exit 1 }
+        if (-not $IPAddresses)  { Write-Error "IPAddresses is required for Storage."; exit 1 }
 
-        $ipList = $IPAddresses -split "," | ForEach-Object { $_.Trim() }
-
-        # Validate all IPs first before doing anything
+        $ipList     = $IPAddresses -split "," | ForEach-Object { $_.Trim() }
         $invalidIPs = $ipList | Where-Object { -not (Validate-IP ($_ -split "/")[0]) }
         if ($invalidIPs) {
-            Write-Error "Invalid IP(s) found: $($invalidIPs -join ', '). Please fix and re-run."
+            Write-Error "Invalid IP(s): $($invalidIPs -join ', '). Fix and re-run."
             exit 1
         }
 
-        $rg = (Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $ResourceName.Trim() }).ResourceGroupName
+        Write-Host " Storage Account : $ResourceName"         -ForegroundColor Cyan
+        Write-Host " IPs to add      : $($ipList -join ', ')" -ForegroundColor Cyan
+        Write-Host ""
+
+        $rg = (Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $ResourceName }).ResourceGroupName
         if (-not $rg) { Write-Error "Storage Account '$ResourceName' not found."; exit 1 }
 
-        $existing = (Get-AzStorageAccount -ResourceGroupName $rg -Name $ResourceName.Trim()).NetworkRuleSet.IpRules.IPAddressOrRange
+        $existing = (Get-AzStorageAccount -ResourceGroupName $rg -Name $ResourceName).NetworkRuleSet.IpRules.IPAddressOrRange
 
         foreach ($ip in $ipList) {
             $cidr = Get-CIDR $ip
             if ($existing -contains $cidr) {
-                Write-Host "  [SKIP] $cidr already exists on Storage: $ResourceName" -ForegroundColor Yellow
+                Write-Host "  [SKIP]  $cidr already exists on Storage: $ResourceName" -ForegroundColor Yellow
             } else {
-                Add-AzStorageAccountNetworkRule -ResourceGroupName $rg -Name $ResourceName.Trim() -IPAddressOrRange $cidr
-                Write-Host "  [ADDED] $cidr → Storage: $ResourceName" -ForegroundColor Green
+                Add-AzStorageAccountNetworkRule -ResourceGroupName $rg -Name $ResourceName -IPAddressOrRange $cidr
+                Write-Host "  [ADDED] $cidr → $ResourceName" -ForegroundColor Green
             }
         }
     }
 
-# ==============================
+# ==============================================================
     "keyvault" {
-        if (-not $ResourceName) { Write-Error "ResourceName is required."; exit 1 }
-        if (-not $IPAddresses)  { Write-Error "IPAddresses is required."; exit 1 }
+        if (-not $ResourceName) { Write-Error "ResourceName is required for KeyVault."; exit 1 }
+        if (-not $IPAddresses)  { Write-Error "IPAddresses is required for KeyVault."; exit 1 }
 
-        $ipList = $IPAddresses -split "," | ForEach-Object { $_.Trim() }
-
-        # Validate all IPs first before doing anything
+        $ipList     = $IPAddresses -split "," | ForEach-Object { $_.Trim() }
         $invalidIPs = $ipList | Where-Object { -not (Validate-IP ($_ -split "/")[0]) }
         if ($invalidIPs) {
-            Write-Error "Invalid IP(s) found: $($invalidIPs -join ', '). Please fix and re-run."
+            Write-Error "Invalid IP(s): $($invalidIPs -join ', '). Fix and re-run."
             exit 1
         }
 
-        $rg = (Get-AzKeyVault -VaultName $ResourceName.Trim()).ResourceGroupName
+        Write-Host " Key Vault  : $ResourceName"              -ForegroundColor Cyan
+        Write-Host " IPs to add : $($ipList -join ', ')"      -ForegroundColor Cyan
+        Write-Host ""
+
+        $rg = (Get-AzKeyVault -VaultName $ResourceName).ResourceGroupName
         if (-not $rg) { Write-Error "Key Vault '$ResourceName' not found."; exit 1 }
 
-        $existing = (Get-AzKeyVault -ResourceGroupName $rg -VaultName $ResourceName.Trim()).NetworkAcls.IpAddressRanges
+        $existing = (Get-AzKeyVault -ResourceGroupName $rg -VaultName $ResourceName).NetworkAcls.IpAddressRanges
 
         foreach ($ip in $ipList) {
             $cidr = Get-CIDR $ip
             if ($existing -contains $cidr) {
-                Write-Host "  [SKIP] $cidr already exists on KeyVault: $ResourceName" -ForegroundColor Yellow
+                Write-Host "  [SKIP]  $cidr already exists on KeyVault: $ResourceName" -ForegroundColor Yellow
             } else {
-                Add-AzKeyVaultNetworkRule -ResourceGroupName $rg -VaultName $ResourceName.Trim() -IpAddressRange $cidr
-                Write-Host "  [ADDED] $cidr → KeyVault: $ResourceName" -ForegroundColor Green
+                Add-AzKeyVaultNetworkRule -ResourceGroupName $rg -VaultName $ResourceName -IpAddressRange $cidr
+                Write-Host "  [ADDED] $cidr → $ResourceName" -ForegroundColor Green
             }
         }
     }
 
-# ==============================
+# ==============================================================
     "sql" {
-        if (-not $SQLServerNames) { Write-Error "SQLServerNames is required."; exit 1 }
-        if (-not $RuleNames)      { Write-Error "RuleNames is required."; exit 1 }
-        if (-not $StartIPs)       { Write-Error "StartIPs is required."; exit 1 }
-        if (-not $EndIPs)         { Write-Error "EndIPs is required."; exit 1 }
+        if (-not $SQLServerNames) { Write-Error "SQLServerNames is required for SQL."; exit 1 }
+        if (-not $RuleNames)      { Write-Error "RuleNames is required for SQL."; exit 1 }
+        if (-not $StartIPs)       { Write-Error "StartIPs is required for SQL."; exit 1 }
+        if (-not $EndIPs)         { Write-Error "EndIPs is required for SQL."; exit 1 }
 
         $nameList  = $SQLServerNames -split "," | ForEach-Object { $_.Trim() }
         $ruleList  = $RuleNames      -split "," | ForEach-Object { $_.Trim() }
         $startList = $StartIPs       -split "," | ForEach-Object { $_.Trim() }
         $endList   = $EndIPs         -split "," | ForEach-Object { $_.Trim() }
 
-        $counts = @($nameList.Count, $ruleList.Count, $startList.Count, $endList.Count)
+        $counts   = @($nameList.Count, $ruleList.Count, $startList.Count, $endList.Count)
         $minCount = ($counts | Measure-Object -Minimum).Minimum
         $maxCount = ($counts | Measure-Object -Maximum).Maximum
 
-        # Warn if counts don't match
         if ($minCount -ne $maxCount) {
-            Write-Host ""
-            Write-Host "==========================================" -ForegroundColor Red
-            Write-Host " COUNT MISMATCH DETECTED" -ForegroundColor Red
-            Write-Host "==========================================" -ForegroundColor Red
-            Write-Host "  SQL Server Names : $($nameList.Count)" -ForegroundColor Yellow
-            Write-Host "  Rule Names       : $($ruleList.Count)" -ForegroundColor Yellow
+            Write-Host "========================================" -ForegroundColor Red
+            Write-Host " COUNT MISMATCH — CHECK YOUR INPUTS"     -ForegroundColor Red
+            Write-Host "========================================" -ForegroundColor Red
+            Write-Host "  SQL Server Names : $($nameList.Count)"  -ForegroundColor Yellow
+            Write-Host "  Rule Names       : $($ruleList.Count)"  -ForegroundColor Yellow
             Write-Host "  Start IPs        : $($startList.Count)" -ForegroundColor Yellow
-            Write-Host "  End IPs          : $($endList.Count)" -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "  Will process only $minCount matched entries." -ForegroundColor Yellow
-            Write-Host "  Please re-validate and enter correct equal counts for all fields." -ForegroundColor Red
-            Write-Host "==========================================" -ForegroundColor Red
-            Write-Host ""
+            Write-Host "  End IPs          : $($endList.Count)"   -ForegroundColor Yellow
+            Write-Host "  Processing only first $minCount matched entries." -ForegroundColor Yellow
+            Write-Host "  Re-run with equal counts for all fields."          -ForegroundColor Red
+            Write-Host "========================================" -ForegroundColor Red
         }
 
-        # Validate IPs for matched entries only
         $invalidStart = $startList[0..($minCount-1)] | Where-Object { -not (Validate-IP $_) }
         $invalidEnd   = $endList[0..($minCount-1)]   | Where-Object { -not (Validate-IP $_) }
-
         if ($invalidStart -or $invalidEnd) {
             Write-Host "Invalid Start IP(s): $($invalidStart -join ', ')" -ForegroundColor Red
             Write-Host "Invalid End IP(s)  : $($invalidEnd   -join ', ')" -ForegroundColor Red
-            Write-Error "Fix the above IPs and re-run."
+            Write-Error "Fix IPs and re-run."
             exit 1
         }
 
-        # Process only matched entries
-        for ($i = 0; $i -lt $minCount; $i++) {
-            $server    = $nameList[$i]
-            $ruleName  = $ruleList[$i]
-            $startIP   = $startList[$i]
-            $endIP     = $endList[$i]
+        Write-Host " SQL Servers to process: $($nameList.Count)" -ForegroundColor Cyan
+        Write-Host ""
 
-            Write-Host ""
-            Write-Host "Processing SQL Server: $server | Rule: $ruleName | $startIP -> $endIP" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $minCount; $i++) {
+            $server   = $nameList[$i]
+            $ruleName = $ruleList[$i]
+            $startIP  = $startList[$i]
+            $endIP    = $endList[$i]
+
+            Write-Host "  Processing: $server | $ruleName | $startIP -> $endIP" -ForegroundColor Cyan
 
             $rg = (Get-AzSqlServer | Where-Object { $_.ServerName -eq $server }).ResourceGroupName
             if (-not $rg) {
-                Write-Host "  [SKIP] SQL Server '$server' not found. Skipping." -ForegroundColor Red
+                Write-Host "  [SKIP] SQL Server '$server' not found." -ForegroundColor Red
                 continue
             }
 
-            $exists = Get-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $server -FirewallRuleName $ruleName -ErrorAction SilentlyContinue
+            $exists = Get-AzSqlServerFirewallRule `
+                -ResourceGroupName $rg `
+                -ServerName $server `
+                -FirewallRuleName $ruleName `
+                -ErrorAction SilentlyContinue
+
             if ($exists) {
-                Set-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $server -FirewallRuleName $ruleName -StartIpAddress $startIP -EndIpAddress $endIP
-                Write-Host "  [UPDATED] Rule '$ruleName' updated on SQL: $server" -ForegroundColor Green
+                Set-AzSqlServerFirewallRule `
+                    -ResourceGroupName $rg `
+                    -ServerName $server `
+                    -FirewallRuleName $ruleName `
+                    -StartIpAddress $startIP `
+                    -EndIpAddress $endIP
+                Write-Host "  [UPDATED] Rule '$ruleName' on SQL: $server" -ForegroundColor Green
             } else {
-                New-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $server -FirewallRuleName $ruleName -StartIpAddress $startIP -EndIpAddress $endIP
-                Write-Host "  [ADDED] Rule '$ruleName' created on SQL: $server" -ForegroundColor Green
+                New-AzSqlServerFirewallRule `
+                    -ResourceGroupName $rg `
+                    -ServerName $server `
+                    -FirewallRuleName $ruleName `
+                    -StartIpAddress $startIP `
+                    -EndIpAddress $endIP
+                Write-Host "  [ADDED] Rule '$ruleName' on SQL: $server" -ForegroundColor Green
             }
         }
     }
 }
+
+Write-Host ""
+Write-Host "======================================" -ForegroundColor Magenta
+Write-Host " COMPLETED"                             -ForegroundColor Magenta
+Write-Host "======================================" -ForegroundColor Magenta
