@@ -1,0 +1,195 @@
+param(
+   [string]$AddStorage         = "false",
+   [string]$AddKeyVault        = "false",
+   [string]$AddSQL             = "false",
+   [string]$StorageAccountName = " ",
+   [string]$KeyVaultName       = " ",
+   [string]$SQLServerName      = " ",
+   [string]$IPAddresses        = " ",
+   [string]$RuleNames          = " ",
+   [string]$StartIPs           = " ",
+   [string]$EndIPs             = " "
+)
+
+# ---- Trim ----
+$StorageAccountName = $StorageAccountName.Trim()
+$KeyVaultName       = $KeyVaultName.Trim()
+$SQLServerName      = $SQLServerName.Trim()
+$IPAddresses        = $IPAddresses.Trim()
+$RuleNames          = $RuleNames.Trim()
+$StartIPs           = $StartIPs.Trim()
+$EndIPs             = $EndIPs.Trim()
+
+# ---- Booleans ----
+$runStorage  = ($AddStorage  -eq "True")
+$runKeyVault = ($AddKeyVault -eq "True")
+$runSQL      = ($AddSQL      -eq "True")
+
+# ---- Helpers ----
+function Test-ValidIP($ip) {
+   return $ip -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
+}
+
+function Test-ValidCIDR($cidr) {
+   if ($cidr -match "^(\d{1,3}\.){3}\d{1,3}/(\d+)$") {
+       $prefix = [int]$Matches[2]
+       return ($prefix -ge 24 -and $prefix -le 31)
+   }
+   return $false
+}
+
+function Resolve-IPEntry($ip) {
+   $ip = $ip.Trim()
+   if ($ip -match "/") {
+       if (Test-ValidCIDR $ip) { return $ip }
+       Write-Error "Invalid CIDR '$ip'. Azure accepts /24 to /31 only. For single IP remove CIDR suffix."
+       exit 1
+   }
+   if (Test-ValidIP $ip) { return $ip }
+   Write-Error "Invalid IP address: '$ip'"
+   exit 1
+}
+
+function Get-RG($name, $type) {
+   switch ($type) {
+       "storage"  { return (Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $name }).ResourceGroupName }
+       "keyvault" { return (Get-AzKeyVault       | Where-Object { $_.VaultName          -eq $name }).ResourceGroupName }
+       "sql"      { return (Get-AzSqlServer       | Where-Object { $_.ServerName         -eq $name }).ResourceGroupName }
+   }
+}
+
+# ---- Guard ----
+if (-not $runStorage -and -not $runKeyVault -and -not $runSQL) {
+   Write-Error "No resource selected. Tick at least one."
+   exit 1
+}
+
+Write-Host "========================================" -ForegroundColor Magenta
+Write-Host " Storage: $runStorage | KeyVault: $runKeyVault | SQL: $runSQL"
+Write-Host "========================================" -ForegroundColor Magenta
+
+# ================================================================
+# STORAGE
+# ================================================================
+if ($runStorage) {
+   Write-Host "`n[STORAGE]" -ForegroundColor Cyan
+   if (-not $StorageAccountName) { Write-Error "StorageAccountName missing in variable group."; exit 1 }
+   if (-not $IPAddresses)        { Write-Error "IPAddresses is required."; exit 1 }
+
+   $ipList      = $IPAddresses -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+   $resolvedIPs = $ipList | ForEach-Object { Resolve-IPEntry $_ }
+
+   $rg = Get-RG $StorageAccountName "storage"
+   if (-not $rg) { Write-Error "Storage Account '$StorageAccountName' not found."; exit 1 }
+
+   $existing = (Get-AzStorageAccount -ResourceGroupName $rg -Name $StorageAccountName).NetworkRuleSet.IpRules.IPAddressOrRange
+
+   foreach ($ip in $resolvedIPs) {
+       if ($existing -contains $ip) {
+           Write-Host "  [SKIP]  $ip already exists" -ForegroundColor Yellow
+       } else {
+           Add-AzStorageAccountNetworkRule -ResourceGroupName $rg -Name $StorageAccountName -IPAddressOrRange $ip
+           Write-Host "  [ADDED] $ip → $StorageAccountName" -ForegroundColor Green
+       }
+   }
+}
+
+# ================================================================
+# KEYVAULT
+# ================================================================
+if ($runKeyVault) {
+   Write-Host "`n[KEYVAULT]" -ForegroundColor Cyan
+   if (-not $KeyVaultName) { Write-Error "KeyVaultName missing in variable group."; exit 1 }
+   if (-not $IPAddresses)  { Write-Error "IPAddresses is required."; exit 1 }
+
+   $ipList      = $IPAddresses -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+   $resolvedIPs = $ipList | ForEach-Object { Resolve-IPEntry $_ }
+
+   $rg = Get-RG $KeyVaultName "keyvault"
+   if (-not $rg) { Write-Error "Key Vault '$KeyVaultName' not found."; exit 1 }
+
+   $existing = (Get-AzKeyVault -ResourceGroupName $rg -VaultName $KeyVaultName).NetworkAcls.IpAddressRanges
+
+   # Azure KeyVault stores plain IPs as "x.x.x.x/32" internally — normalize for comparison
+   $existingNormalized = $existing | ForEach-Object { $_ -replace "/32$", "" }
+
+   foreach ($ip in $resolvedIPs) {
+       $ipForCheck = $ip -replace "/32$", ""
+       if ($existingNormalized -contains $ipForCheck) {
+           Write-Host "  [SKIP]  $ip already exists" -ForegroundColor Yellow
+       } else {
+           Add-AzKeyVaultNetworkRule -ResourceGroupName $rg -VaultName $KeyVaultName -IpAddressRange $ip
+           Write-Host "  [ADDED] $ip → $KeyVaultName" -ForegroundColor Green
+       }
+   }
+}
+
+# ================================================================
+# SQL — Single server, multiple rules
+# ================================================================
+if ($runSQL) {
+   Write-Host "`n[SQL]" -ForegroundColor Cyan
+   if (-not $SQLServerName) { Write-Error "SQLServerName missing in variable group."; exit 1 }
+   if (-not $RuleNames)     { Write-Error "RuleNames is required."; exit 1 }
+   if (-not $StartIPs)      { Write-Error "StartIPs is required."; exit 1 }
+   if (-not $EndIPs)        { Write-Error "EndIPs is required."; exit 1 }
+
+   $ruleList  = $RuleNames -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+   $startList = $StartIPs  -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+   $endList   = $EndIPs    -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+   # Count match — only rules, startIPs, endIPs must match
+   if (($ruleList.Count -ne $startList.Count) -or ($ruleList.Count -ne $endList.Count)) {
+       Write-Host "  COUNT MISMATCH:" -ForegroundColor Red
+       Write-Host "  Rule Names : $($ruleList.Count)"  -ForegroundColor Yellow
+       Write-Host "  Start IPs  : $($startList.Count)" -ForegroundColor Yellow
+       Write-Host "  End IPs    : $($endList.Count)"   -ForegroundColor Yellow
+       Write-Error "RuleNames, StartIPs and EndIPs must have equal number of comma separated values."
+       exit 1
+   }
+
+   # Validate IPs — reject CIDR, accept plain IPs only
+   $allIPs  = $startList + $endList
+   $hasCIDR = $allIPs | Where-Object { $_ -match "/" }
+   $invalid = $allIPs | Where-Object { -not (Test-ValidIP $_) -and $_ -notmatch "/" }
+
+   if ($hasCIDR) {
+       Write-Error "SQL does not accept CIDR notation. Remove the subnet mask: $($hasCIDR -join ', ')"
+       exit 1
+   }
+   if ($invalid) {
+       Write-Error "Invalid IP(s): $($invalid -join ', ')"
+       exit 1
+   }
+
+   $rg = Get-RG $SQLServerName "sql"
+   if (-not $rg) { Write-Error "SQL Server '$SQLServerName' not found."; exit 1 }
+
+   Write-Host "  Server: $SQLServerName | Rules to process: $($ruleList.Count)" -ForegroundColor Cyan
+
+   for ($i = 0; $i -lt $ruleList.Count; $i++) {
+       $ruleName = $ruleList[$i]
+       $startIP  = $startList[$i]
+       $endIP    = $endList[$i]
+
+       Write-Host "  Processing: $ruleName | $startIP → $endIP" -ForegroundColor Cyan
+
+       $exists = Get-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName -FirewallRuleName $ruleName -ErrorAction SilentlyContinue
+
+       if ($exists) {
+           if ($exists.StartIpAddress -eq $startIP -and $exists.EndIpAddress -eq $endIP) {
+               Write-Host "  [SKIP]  Rule '$ruleName' already exists with same IPs" -ForegroundColor Yellow
+           } else {
+               Set-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName -FirewallRuleName $ruleName -StartIpAddress $startIP -EndIpAddress $endIP
+               Write-Host "  [UPDATED] $ruleName → $startIP to $endIP" -ForegroundColor Green
+           }
+       } else {
+           New-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName -FirewallRuleName $ruleName -StartIpAddress $startIP -EndIpAddress $endIP
+           Write-Host "  [ADDED] $ruleName → $startIP to $endIP" -ForegroundColor Green
+       }
+   }
+}
+
+Write-Host "`n======================================" -ForegroundColor Magenta
+Write-Host " COMPLETED" -ForegroundColor Magenta
+Write-Host "======================================" -ForegroundColor Magenta
