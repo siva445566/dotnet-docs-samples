@@ -1,0 +1,437 @@
+param(
+    [string]$AddStorage         = "false",
+    [string]$AddKeyVault        = "false",
+    [string]$AddSQL             = "false",
+    [string]$AddFunction        = "false",
+    [string]$AddAppService      = "false",
+    [string]$StorageAccountName = " ",
+    [string]$KeyVaultName       = " ",
+    [string]$SQLServerName      = " ",
+    [string]$FunctionAppName    = " ",
+    [string]$AppServiceName     = " ",
+    [string]$IPAddresses        = " ",
+    [string]$RuleNames          = " ",
+    [string]$StartIPs           = " ",
+    [string]$EndIPs             = " ",
+    [string]$Priorities         = " "
+)
+
+# ---- Trim ----
+$StorageAccountName = $StorageAccountName.Trim()
+$KeyVaultName       = $KeyVaultName.Trim()
+$SQLServerName      = $SQLServerName.Trim()
+$FunctionAppName    = $FunctionAppName.Trim()
+$AppServiceName     = $AppServiceName.Trim()
+$IPAddresses        = $IPAddresses.Trim()
+$RuleNames          = $RuleNames.Trim()
+$StartIPs           = $StartIPs.Trim()
+$EndIPs             = $EndIPs.Trim()
+$Priorities         = $Priorities.Trim()
+
+# ---- Booleans ----
+$runStorage    = ($AddStorage    -eq "True")
+$runKeyVault   = ($AddKeyVault   -eq "True")
+$runSQL        = ($AddSQL        -eq "True")
+$runFunction   = ($AddFunction   -eq "True")
+$runAppService = ($AddAppService -eq "True")
+
+# ---- Helpers ----
+function Test-ValidIP($ip) {
+    return $ip -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
+}
+
+function Test-ValidCIDR($cidr) {
+    if ($cidr -match "^(\d{1,3}\.){3}\d{1,3}/(\d+)$") {
+        $prefix = [int]$Matches[2]
+        return ($prefix -ge 24 -and $prefix -le 31)
+    }
+    return $false
+}
+
+function Resolve-IPEntry($ip) {
+    $ip = $ip.Trim()
+    if ($ip -match "/") {
+        if (Test-ValidCIDR $ip) { return $ip }
+        Write-Error "Invalid CIDR '$ip'. Azure accepts /24 to /31 only. For single IP remove CIDR suffix."
+        exit 1
+    }
+    if (Test-ValidIP $ip) { return $ip }
+    Write-Error "Invalid IP address: '$ip'"
+    exit 1
+}
+
+function Test-ValidIPStrict($ip) {
+    return [System.Net.IPAddress]::TryParse($ip, [ref]$null)
+}
+
+function Get-RG($name, $type) {
+    switch ($type) {
+        "storage"    { return (Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $name }).ResourceGroupName }
+        "keyvault"   { return (Get-AzKeyVault       | Where-Object { $_.VaultName          -eq $name }).ResourceGroupName }
+        "sql"        { return (Get-AzSqlServer       | Where-Object { $_.ServerName         -eq $name }).ResourceGroupName }
+        "function"   {
+            $fa = Get-AzFunctionApp | Where-Object { $_.Name -eq $name }
+            return $fa.ResourceGroupName
+        }
+        "appservice" {
+            $wa = Get-AzWebApp | Where-Object { $_.Name -eq $name }
+            return $wa.ResourceGroupName
+        }
+    }
+}
+
+# ---- Guard ----
+if (-not $runStorage -and -not $runKeyVault -and -not $runSQL -and -not $runFunction -and -not $runAppService) {
+    Write-Error "No resource selected. Tick at least one."
+    exit 1
+}
+
+Write-Host "========================================" -ForegroundColor Magenta
+Write-Host " Storage: $runStorage | KeyVault: $runKeyVault | SQL: $runSQL | Function: $runFunction | AppService: $runAppService"
+Write-Host "========================================" -ForegroundColor Magenta
+
+# ================================================================
+# STORAGE
+# ================================================================
+if ($runStorage) {
+    Write-Host "`n[STORAGE]" -ForegroundColor Cyan
+    if (-not $StorageAccountName) { Write-Error "StorageAccountName missing in variable group."; exit 1 }
+    if (-not $IPAddresses)        { Write-Error "IPAddresses is required."; exit 1 }
+
+    $ipList      = $IPAddresses -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $resolvedIPs = $ipList | ForEach-Object { Resolve-IPEntry $_ }
+
+    $rg = Get-RG $StorageAccountName "storage"
+    if (-not $rg) { Write-Error "Storage Account '$StorageAccountName' not found."; exit 1 }
+
+    $existing = (Get-AzStorageAccount -ResourceGroupName $rg -Name $StorageAccountName).NetworkRuleSet.IpRules.IPAddressOrRange
+
+    foreach ($ip in $resolvedIPs) {
+        if ($existing -contains $ip) {
+            Write-Host "  [SKIP]  $ip already exists" -ForegroundColor Yellow
+        } else {
+            Add-AzStorageAccountNetworkRule -ResourceGroupName $rg -Name $StorageAccountName -IPAddressOrRange $ip
+            Write-Host "  [ADDED] $ip → $StorageAccountName" -ForegroundColor Green
+        }
+    }
+}
+
+# ================================================================
+# KEYVAULT
+# ================================================================
+if ($runKeyVault) {
+    Write-Host "`n[KEYVAULT]" -ForegroundColor Cyan
+    if (-not $KeyVaultName)  { Write-Error "KeyVaultName missing in variable group."; exit 1 }
+    if (-not $IPAddresses)   { Write-Error "IPAddresses is required."; exit 1 }
+
+    $ipList      = $IPAddresses -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $resolvedIPs = $ipList | ForEach-Object { Resolve-IPEntry $_ }
+
+    $rg = Get-RG $KeyVaultName "keyvault"
+    if (-not $rg) { Write-Error "Key Vault '$KeyVaultName' not found."; exit 1 }
+
+    $existing = (Get-AzKeyVault -ResourceGroupName $rg -VaultName $KeyVaultName).NetworkAcls.IpAddressRanges
+
+    # Normalize existing IPs — Azure stores plain IPs as "x.x.x.x/32" internally
+    $existingNormalized = $existing | ForEach-Object { $_ -replace "/32$", "" }
+
+    foreach ($ip in $resolvedIPs) {
+        $ipForCheck = $ip -replace "/32$", ""
+
+        if ($existingNormalized -contains $ipForCheck) {
+            Write-Host "  [SKIP]  $ip already exists" -ForegroundColor Yellow
+        } else {
+            Add-AzKeyVaultNetworkRule -ResourceGroupName $rg -VaultName $KeyVaultName -IpAddressRange $ip
+            Write-Host "  [ADDED] $ip → $KeyVaultName" -ForegroundColor Green
+        }
+    }
+}
+
+# ================================================================
+# SQL
+# ================================================================
+if ($runSQL) {
+    Write-Host "`n[SQL]" -ForegroundColor Cyan
+
+    if (-not $SQLServerName) { Write-Error "SQLServerName missing in variable group."; exit 1 }
+    if (-not $RuleNames)     { Write-Error "RuleNames is required."; exit 1 }
+    if (-not $StartIPs)      { Write-Error "StartIPs is required."; exit 1 }
+    if (-not $EndIPs)        { Write-Error "EndIPs is required."; exit 1 }
+
+    $ruleList = @($RuleNames.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    $startList = @($StartIPs.Split(",") | ForEach-Object { $_.Trim().Replace(" ","") } | Where-Object { $_ -ne "" })
+    $endList   = @($EndIPs.Split(",")   | ForEach-Object { $_.Trim().Replace(" ","") } | Where-Object { $_ -ne "" })
+
+    Write-Host "--------------------------------------"
+    Write-Host "Rule Names : $($ruleList -join ' | ')"
+    Write-Host "Start IPs  : $($startList -join ' | ')"
+    Write-Host "End IPs    : $($endList -join ' | ')"
+    Write-Host "--------------------------------------"
+
+    if (($ruleList.Count -ne $startList.Count) -or ($ruleList.Count -ne $endList.Count)) {
+        Write-Host "COUNT MISMATCH DETECTED" -ForegroundColor Red
+        Write-Host "Rule Count  : $($ruleList.Count)"
+        Write-Host "Start Count : $($startList.Count)"
+        Write-Host "End Count   : $($endList.Count)"
+        Write-Error "RuleNames, StartIPs and EndIPs must contain equal comma-separated values."
+        exit 1
+    }
+
+    for ($i = 0; $i -lt $startList.Count; $i++) {
+        if (-not (Test-ValidIPStrict $startList[$i])) { Write-Error "Invalid Start IP: $($startList[$i])"; exit 1 }
+        if (-not (Test-ValidIPStrict $endList[$i]))   { Write-Error "Invalid End IP: $($endList[$i])"; exit 1 }
+    }
+
+    $rg = Get-RG $SQLServerName "sql"
+    if (-not $rg) { Write-Error "SQL Server '$SQLServerName' not found."; exit 1 }
+
+    Write-Host "`nSQL Server  : $SQLServerName"
+    Write-Host "Rules Count : $($ruleList.Count)`n"
+
+    for ($i = 0; $i -lt $ruleList.Count; $i++) {
+        $ruleName = $ruleList[$i]
+        $startIP  = $startList[$i]
+        $endIP    = $endList[$i]
+
+        Write-Host "Processing Rule : $ruleName | Start: $startIP | End: $endIP"
+
+        $existingRule = Get-AzSqlServerFirewallRule `
+            -ResourceGroupName $rg `
+            -ServerName $SQLServerName `
+            -FirewallRuleName $ruleName `
+            -ErrorAction SilentlyContinue
+
+        if ($existingRule) {
+            if (($existingRule.StartIpAddress -eq $startIP) -and ($existingRule.EndIpAddress -eq $endIP)) {
+                Write-Host "  [SKIP] Rule already exists with same IPs." -ForegroundColor Yellow
+            } else {
+                Set-AzSqlServerFirewallRule `
+                    -ResourceGroupName $rg `
+                    -ServerName $SQLServerName `
+                    -FirewallRuleName $ruleName `
+                    -StartIpAddress $startIP `
+                    -EndIpAddress $endIP
+                Write-Host "  [UPDATED] $ruleName → $startIP to $endIP" -ForegroundColor Green
+            }
+        } else {
+            New-AzSqlServerFirewallRule `
+                -ResourceGroupName $rg `
+                -ServerName $SQLServerName `
+                -FirewallRuleName $ruleName `
+                -StartIpAddress $startIP `
+                -EndIpAddress $endIP
+            Write-Host "  [ADDED] $ruleName → $startIP to $endIP" -ForegroundColor Green
+        }
+        Write-Host ""
+    }
+}
+
+# ================================================================
+# AZURE FUNCTION
+# ================================================================
+if ($runFunction) {
+    Write-Host "`n[AZURE FUNCTION]" -ForegroundColor Cyan
+
+    if (-not $FunctionAppName) { Write-Error "FunctionAppName missing in variable group."; exit 1 }
+    if (-not $RuleNames)       { Write-Error "RuleNames is required (shared with SQL block)."; exit 1 }
+    if (-not $IPAddresses)     { Write-Error "IPAddresses is required (picked from Storage/KeyVault block)."; exit 1 }
+    if (-not $Priorities)      { Write-Error "Priorities is required for Azure Function rules."; exit 1 }
+
+    # ---- Split inputs ----
+    # Rule names: shared with SQL block
+    $ruleList = @($RuleNames.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+
+    # IPs: picked from the same IPAddresses used by Storage and Key Vault
+    $ipList      = $IPAddresses -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $resolvedIPs = $ipList | ForEach-Object { Resolve-IPEntry $_ }
+
+    # Priorities: one per rule, comma-separated
+    $priorityList = @($Priorities.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+
+    Write-Host "--------------------------------------"
+    Write-Host "Rule Names   : $($ruleList -join ' | ')"
+    Write-Host "IP Addresses : $($resolvedIPs -join ' | ')"
+    Write-Host "Priorities   : $($priorityList -join ' | ')"
+    Write-Host "--------------------------------------"
+
+    # ---- Count validation: rules, IPs and priorities must match ----
+    if (($ruleList.Count -ne $resolvedIPs.Count) -or ($ruleList.Count -ne $priorityList.Count)) {
+        Write-Host "COUNT MISMATCH DETECTED" -ForegroundColor Red
+        Write-Host "Rule Count     : $($ruleList.Count)"
+        Write-Host "IP Count       : $($resolvedIPs.Count)"
+        Write-Host "Priority Count : $($priorityList.Count)"
+        Write-Error "RuleNames, IPAddresses and Priorities must contain equal comma-separated values for Azure Function."
+        exit 1
+    }
+
+    # ---- Validate priorities are integers ----
+    for ($i = 0; $i -lt $priorityList.Count; $i++) {
+        $p = $priorityList[$i]
+        if ($p -notmatch "^\d+$") {
+            Write-Error "Invalid Priority '$p' at position $($i + 1). Priority must be a positive integer."
+            exit 1
+        }
+    }
+
+    # ---- Resolve resource group ----
+    $rg = Get-RG $FunctionAppName "function"
+    if (-not $rg) { Write-Error "Function App '$FunctionAppName' not found."; exit 1 }
+
+    Write-Host "`nFunction App : $FunctionAppName"
+    Write-Host "Rules Count  : $($ruleList.Count)`n"
+
+    # ---- Get current access restriction rules ----
+    $webApp        = Get-AzWebApp -ResourceGroupName $rg -Name $FunctionAppName
+    $existingRules = $webApp.SiteConfig.IpSecurityRestrictions
+
+    for ($i = 0; $i -lt $ruleList.Count; $i++) {
+        $ruleName = $ruleList[$i]
+        $ip       = $resolvedIPs[$i]
+        $priority = [int]$priorityList[$i]
+
+        # Normalise to CIDR — single IPs need /32 suffix for Function App access restrictions
+        $ipCidr = if ($ip -match "/") { $ip } else { "$ip/32" }
+
+        Write-Host "Processing Rule : $ruleName | IP: $ipCidr | Priority: $priority"
+
+        $matchedRule = $existingRules | Where-Object { $_.Name -eq $ruleName }
+
+        if ($matchedRule) {
+            if (($matchedRule.IpAddress -eq $ipCidr) -and ($matchedRule.Priority -eq $priority)) {
+                Write-Host "  [SKIP] Rule '$ruleName' already exists with same IP and priority." -ForegroundColor Yellow
+            } else {
+                # Remove then re-add with new values
+                Remove-AzWebAppAccessRestrictionRule `
+                    -ResourceGroupName $rg `
+                    -WebAppName $FunctionAppName `
+                    -Name $ruleName
+
+                Add-AzWebAppAccessRestrictionRule `
+                    -ResourceGroupName $rg `
+                    -WebAppName $FunctionAppName `
+                    -Name $ruleName `
+                    -IpAddress $ipCidr `
+                    -Action Allow `
+                    -Priority $priority
+
+                Write-Host "  [UPDATED] $ruleName → $ipCidr | Priority: $priority" -ForegroundColor Green
+            }
+        } else {
+            Add-AzWebAppAccessRestrictionRule `
+                -ResourceGroupName $rg `
+                -WebAppName $FunctionAppName `
+                -Name $ruleName `
+                -IpAddress $ipCidr `
+                -Action Allow `
+                -Priority $priority
+
+            Write-Host "  [ADDED] $ruleName → $ipCidr | Priority: $priority" -ForegroundColor Green
+        }
+        Write-Host ""
+    }
+}
+
+# ================================================================
+# APP SERVICE
+# ================================================================
+if ($runAppService) {
+    Write-Host "`n[APP SERVICE]" -ForegroundColor Cyan
+
+    if (-not $AppServiceName) { Write-Error "AppServiceName missing in variable group."; exit 1 }
+    if (-not $RuleNames)      { Write-Error "RuleNames is required (shared with SQL block)."; exit 1 }
+    if (-not $IPAddresses)    { Write-Error "IPAddresses is required (picked from Storage/KeyVault block)."; exit 1 }
+    if (-not $Priorities)     { Write-Error "Priorities is required for App Service rules."; exit 1 }
+
+    # ---- Split inputs ----
+    # Rule names: shared with SQL block
+    $ruleList = @($RuleNames.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+
+    # IPs: picked from the same IPAddresses used by Storage and Key Vault
+    $ipList      = $IPAddresses -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $resolvedIPs = $ipList | ForEach-Object { Resolve-IPEntry $_ }
+
+    # Priorities: one per rule, comma-separated
+    $priorityList = @($Priorities.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+
+    Write-Host "--------------------------------------"
+    Write-Host "Rule Names : $($ruleList -join ' | ')"
+    Write-Host "IP Addresses : $($resolvedIPs -join ' | ')"
+    Write-Host "Priorities : $($priorityList -join ' | ')"
+    Write-Host "--------------------------------------"
+
+    # ---- Count validation: rules, IPs and priorities must match ----
+    if (($ruleList.Count -ne $resolvedIPs.Count) -or ($ruleList.Count -ne $priorityList.Count)) {
+        Write-Host "COUNT MISMATCH DETECTED" -ForegroundColor Red
+        Write-Host "Rule Count     : $($ruleList.Count)"
+        Write-Host "IP Count       : $($resolvedIPs.Count)"
+        Write-Host "Priority Count : $($priorityList.Count)"
+        Write-Error "RuleNames, IPAddresses and Priorities must contain equal comma-separated values for App Service."
+        exit 1
+    }
+
+    # ---- Validate priorities are integers ----
+    for ($i = 0; $i -lt $priorityList.Count; $i++) {
+        $p = $priorityList[$i]
+        if ($p -notmatch "^\d+$") {
+            Write-Error "Invalid Priority '$p' at position $($i + 1). Priority must be a positive integer."
+            exit 1
+        }
+    }
+
+    # ---- Resolve resource group ----
+    $rg = Get-RG $AppServiceName "appservice"
+    if (-not $rg) { Write-Error "App Service '$AppServiceName' not found."; exit 1 }
+
+    Write-Host "`nApp Service  : $AppServiceName"
+    Write-Host "Rules Count  : $($ruleList.Count)`n"
+
+    # ---- Get current access restriction rules ----
+    $webApp        = Get-AzWebApp -ResourceGroupName $rg -Name $AppServiceName
+    $existingRules = $webApp.SiteConfig.IpSecurityRestrictions
+
+    for ($i = 0; $i -lt $ruleList.Count; $i++) {
+        $ruleName = $ruleList[$i]
+        $ip       = $resolvedIPs[$i]
+        $priority = [int]$priorityList[$i]
+
+        # Normalise to CIDR — single IPs need /32 suffix for App Service access restrictions
+        $ipCidr = if ($ip -match "/") { $ip } else { "$ip/32" }
+
+        Write-Host "Processing Rule : $ruleName | IP: $ipCidr | Priority: $priority"
+
+        $matchedRule = $existingRules | Where-Object { $_.Name -eq $ruleName }
+
+        if ($matchedRule) {
+            if (($matchedRule.IpAddress -eq $ipCidr) -and ($matchedRule.Priority -eq $priority)) {
+                Write-Host "  [SKIP] Rule '$ruleName' already exists with same IP and priority." -ForegroundColor Yellow
+            } else {
+                # Remove then re-add with new values
+                Remove-AzWebAppAccessRestrictionRule `
+                    -ResourceGroupName $rg `
+                    -WebAppName $AppServiceName `
+                    -Name $ruleName
+
+                Add-AzWebAppAccessRestrictionRule `
+                    -ResourceGroupName $rg `
+                    -WebAppName $AppServiceName `
+                    -Name $ruleName `
+                    -IpAddress $ipCidr `
+                    -Action Allow `
+                    -Priority $priority
+
+                Write-Host "  [UPDATED] $ruleName → $ipCidr | Priority: $priority" -ForegroundColor Green
+            }
+        } else {
+            Add-AzWebAppAccessRestrictionRule `
+                -ResourceGroupName $rg `
+                -WebAppName $AppServiceName `
+                -Name $ruleName `
+                -IpAddress $ipCidr `
+                -Action Allow `
+                -Priority $priority
+
+            Write-Host "  [ADDED] $ruleName → $ipCidr | Priority: $priority" -ForegroundColor Green
+        }
+        Write-Host ""
+    }
+}
