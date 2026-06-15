@@ -1,0 +1,78 @@
+if ($runSQL) {
+    Write-Host "`n[SQL]" -ForegroundColor Cyan
+    if (-not $SQLServerName) { Write-Error "SQLServerName is required."; exit 1 }
+    if (-not $RuleNames)     { Write-Error "RuleNames is required."; exit 1 }
+    if (-not $StartIPs)      { Write-Error "StartIPs is required."; exit 1 }
+    if (-not $EndIPs)        { Write-Error "EndIPs is required."; exit 1 }
+
+    [string[]]$ruleList  = Split-CSV $RuleNames
+    [string[]]$startList = Split-CSV $StartIPs
+    [string[]]$endList   = Split-CSV $EndIPs
+
+    if ($ruleList.Count -ne $startList.Count -or $ruleList.Count -ne $endList.Count) {
+        Write-Error "Count mismatch — RuleNames:$($ruleList.Count) StartIPs:$($startList.Count) EndIPs:$($endList.Count)"; exit 1
+    }
+
+    $rg = (Get-AzSqlServer | Where-Object { $_.ServerName -eq $SQLServerName }).ResourceGroupName
+    if (-not $rg) { Write-Error "SQL Server '$SQLServerName' not found."; exit 1 }
+
+    # Helper: convert IP string to a comparable integer
+    function ConvertTo-IPInt([string]$ip) {
+        $bytes = [System.Net.IPAddress]::Parse($ip).GetAddressBytes()
+        [Array]::Reverse($bytes)
+        return [System.BitConverter]::ToUInt32($bytes, 0)
+    }
+
+    # Fetch all existing firewall rules once
+    $allExistingRules = Get-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName
+
+    for ($i = 0; $i -lt $ruleList.Count; $i++) {
+        $ruleName = $ruleList[$i]
+        $startIP  = $startList[$i]
+        $endIP    = $endList[$i]
+
+        if (-not [System.Net.IPAddress]::TryParse($startIP, [ref]$null)) { Write-Error "Invalid Start IP: $startIP"; exit 1 }
+        if (-not [System.Net.IPAddress]::TryParse($endIP,   [ref]$null)) { Write-Error "Invalid End IP: $endIP";   exit 1 }
+
+        Write-Host "  Rule: $ruleName | $startIP -> $endIP"
+
+        $newStart = ConvertTo-IPInt $startIP
+        $newEnd   = ConvertTo-IPInt $endIP
+
+        if ($newStart -gt $newEnd) {
+            Write-Error "Start IP '$startIP' is greater than End IP '$endIP'."; exit 1
+        }
+
+        # Check every existing rule for overlap
+        $overlapFound = $false
+        foreach ($existing in $allExistingRules) {
+            $exStart = ConvertTo-IPInt $existing.StartIpAddress
+            $exEnd   = ConvertTo-IPInt $existing.EndIpAddress
+
+            # Overlap condition: new range starts before existing ends AND new range ends after existing starts
+            if ($newStart -le $exEnd -and $newEnd -ge $exStart) {
+                Write-Host "  [SKIP] '$startIP -> $endIP' overlaps with existing rule '$($existing.FirewallRuleName)' ($($existing.StartIpAddress) -> $($existing.EndIpAddress)). The IP range is already covered." -ForegroundColor Yellow
+                $overlapFound = $true
+                break
+            }
+        }
+
+        if ($overlapFound) { continue }
+
+        # No overlap — check if the rule name already exists (different range)
+        $nameMatch = $allExistingRules | Where-Object { $_.FirewallRuleName -eq $ruleName }
+        if ($nameMatch) {
+            if ($nameMatch.StartIpAddress -eq $startIP -and $nameMatch.EndIpAddress -eq $endIP) {
+                Write-Host "  [SKIP] Rule '$ruleName' already exists with the same IP range." -ForegroundColor Yellow
+            } else {
+                Set-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName `
+                    -FirewallRuleName $ruleName -StartIpAddress $startIP -EndIpAddress $endIP
+                Write-Host "  [UPDATED] $ruleName ($startIP -> $endIP)" -ForegroundColor Green
+            }
+        } else {
+            New-AzSqlServerFirewallRule -ResourceGroupName $rg -ServerName $SQLServerName `
+                -FirewallRuleName $ruleName -StartIpAddress $startIP -EndIpAddress $endIP
+            Write-Host "  [ADDED] $ruleName ($startIP -> $endIP)" -ForegroundColor Green
+        }
+    }
+}
