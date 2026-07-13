@@ -1,0 +1,187 @@
+<#
+.SYNOPSIS
+    Gets the results.zip artifact URL from the latest run of an Azure Load Test,
+    downloads it locally (for use as a pipeline artifact), and optionally copies
+    it to a blob container using azcopy.
+
+.DESCRIPTION
+    1. Finds the load test by display name inside the given Azure Load Testing resource.
+    2. Finds the latest test run for that test.
+    3. Runs "az load test-run get-artifacts-url" to get the SAS URL of results.zip.
+    4. Downloads the file to a local folder (e.g. $(Build.ArtifactStagingDirectory)
+       in Azure DevOps, or any folder your pipeline publishes as an artifact).
+    5. OPTIONAL: if -CopyToContainer is passed, also azcopy's the file into a
+       destination blob container.
+
+.PREREQUISITES
+    - Azure CLI installed and logged in (az login)
+    - az cli "load" extension: az extension add --name load
+    - azcopy on PATH ONLY if you use -CopyToContainer
+
+.EXAMPLE (download only, for a pipeline artifact)
+    ./Get-LoadTestArtifacts.ps1 `
+        -ResourceGroup "sample-rg" `
+        -LoadTestResourceName "sample-alt-resource" `
+        -TestName "enduranceloadtest" `
+        -OutputDirectory "$(Build.ArtifactStagingDirectory)/loadtest-results"
+
+.EXAMPLE (download + copy to blob container)
+    ./Get-LoadTestArtifacts.ps1 `
+        -ResourceGroup "sample-rg" `
+        -LoadTestResourceName "sample-alt-resource" `
+        -TestName "enduranceloadtest" `
+        -OutputDirectory "./loadtest-results" `
+        -CopyToContainer `
+        -DestStorageAccount "mystorageacct" `
+        -DestContainer "loadtest" `
+        -DestSasToken "?sv=2022-11-02&ss=b&srt=co&sp=rwdlac...."
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroup,
+
+    [Parameter(Mandatory = $true)]
+    [string]$LoadTestResourceName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$TestName,                      # e.g. "enduranceloadtest" - this is the test's displayName
+
+    [string]$OutputDirectory = "./loadtest-results",   # local folder to download into (point this at your pipeline artifact staging dir)
+
+    [switch]$CopyToContainer,               # if set, also azcopy the file to a blob container
+
+    [string]$DestStorageAccount,            # required if -CopyToContainer
+    [string]$DestContainer = "loadtest",    # destination container name
+    [string]$DestSasToken                   # required if -CopyToContainer (starts with "?")
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-Step($msg) {
+    Write-Host ""
+    Write-Host "==> $msg" -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------
+# 0. Sanity checks
+# ---------------------------------------------------------------------------
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw "Azure CLI (az) not found on PATH."
+}
+if ($CopyToContainer -and -not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
+    throw "azcopy not found on PATH. Install it from https://aka.ms/downloadazcopy, or omit -CopyToContainer."
+}
+if ($CopyToContainer -and (-not $DestStorageAccount -or -not $DestSasToken)) {
+    throw "-DestStorageAccount and -DestSasToken are required when -CopyToContainer is set."
+}
+
+# ---------------------------------------------------------------------------
+# 1. Find the load test by display name and get its testId
+# ---------------------------------------------------------------------------
+Write-Step "Looking up load test '$TestName' in resource '$LoadTestResourceName'"
+
+$testsJson = az load test list `
+    --load-test-resource $LoadTestResourceName `
+    --resource-group $ResourceGroup `
+    -o json
+
+if (-not $testsJson) { throw "Failed to list load tests. Check resource name/resource group." }
+
+$tests = $testsJson | ConvertFrom-Json
+$test = $tests | Where-Object { $_.displayName -eq $TestName }
+
+if (-not $test) {
+    throw "No load test found with displayName '$TestName'."
+}
+
+$testId = $test.testId
+Write-Host "Found testId: $testId"
+
+# ---------------------------------------------------------------------------
+# 2. List test runs for that test and get the latest one
+# ---------------------------------------------------------------------------
+Write-Step "Fetching test runs for testId '$testId'"
+
+$runsJson = az load test-run list `
+    --load-test-resource $LoadTestResourceName `
+    --resource-group $ResourceGroup `
+    --test-id $testId `
+    -o json
+
+if (-not $runsJson) { throw "Failed to list test runs." }
+
+$runs = $runsJson | ConvertFrom-Json
+if (-not $runs -or $runs.Count -eq 0) {
+    throw "No test runs found for testId '$testId'."
+}
+
+$latestRun = $runs | Sort-Object { [datetime]$_.executedDateTime } -Descending | Select-Object -First 1
+$testRunId = $latestRun.testRunId
+Write-Host "Latest testRunId: $testRunId (executed $($latestRun.executedDateTime))"
+
+# ---------------------------------------------------------------------------
+# 3. Get the artifacts SAS URL(s) for this test run
+# ---------------------------------------------------------------------------
+Write-Step "Fetching artifacts URL for testRunId '$testRunId'"
+
+$artifactsJson = az load test-run get-artifacts-url `
+    --load-test-resource $LoadTestResourceName `
+    --resource-group $ResourceGroup `
+    --test-run-id $testRunId `
+    -o json
+
+if (-not $artifactsJson) { throw "Failed to get artifacts URL." }
+
+$artifacts = $artifactsJson | ConvertFrom-Json
+$resultFileInfo = $artifacts.outputArtifacts.resultFileInfo
+
+if (-not $resultFileInfo -or -not $resultFileInfo.url) {
+    throw "No results.zip artifact found on this test run. It may still be processing."
+}
+
+# Trim any stray quotes/whitespace that can sneak in from JSON parsing
+$sourceSasUrl = $resultFileInfo.url.Trim()
+$fileName = if ($resultFileInfo.fileName) { $resultFileInfo.fileName } else { "$testRunId-results.zip" }
+
+Write-Host "Artifact file: $fileName"
+
+# ---------------------------------------------------------------------------
+# 4. Download locally (this is what your pipeline "Publish Artifact" step should pick up)
+# ---------------------------------------------------------------------------
+Write-Step "Downloading artifact to local folder '$OutputDirectory'"
+
+if (-not (Test-Path $OutputDirectory)) {
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+}
+
+$localPath = Join-Path $OutputDirectory $fileName
+
+# Use Invoke-WebRequest with -UseBasicParsing for reliability on hosted agents,
+# and always quote the SAS URL since it contains "&" characters.
+Invoke-WebRequest -Uri $sourceSasUrl -OutFile $localPath -UseBasicParsing
+
+if (-not (Test-Path $localPath)) {
+    throw "Download failed - file not found at $localPath"
+}
+
+Write-Host "Downloaded to: $localPath"
+
+# ---------------------------------------------------------------------------
+# 5. OPTIONAL: azcopy the results.zip into a destination blob container
+# ---------------------------------------------------------------------------
+if ($CopyToContainer) {
+    Write-Step "Copying artifact to destination container '$DestContainer' via azcopy"
+
+    $destUrl = "https://$DestStorageAccount.blob.core.windows.net/$DestContainer/$fileName$DestSasToken"
+
+    azcopy copy "$sourceSasUrl" "$destUrl" --overwrite=true
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "azcopy copy failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "Copied to container '$DestContainer' on '$DestStorageAccount'."
+}
+
+Write-Step "Done."
