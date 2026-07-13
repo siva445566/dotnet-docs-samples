@@ -1,0 +1,162 @@
+<#
+.SYNOPSIS
+    Downloads the results.zip artifact from the latest run of an Azure Load Test
+    and copies it into a target blob container using azcopy.
+
+.DESCRIPTION
+    1. Finds the load test by display name inside the given Azure Load Testing resource.
+    2. Finds the latest test run for that test.
+    3. Calls the Load Testing data-plane REST API to get the SAS URL of the results.zip artifact.
+    4. Uses azcopy to copy that file into the destination container ("loadtest" by default).
+
+.PREREQUISITES
+    - Azure CLI installed and logged in (az login)
+    - az cli "load" extension: az extension add --name load
+    - azcopy installed and available on PATH
+    - Destination container must already exist, and you need either:
+        a) a SAS token for the destination container, or
+        b) "Storage Blob Data Contributor" role + azcopy login (azcopy login) for AAD auth
+
+.EXAMPLE
+    ./Get-LoadTestArtifacts.ps1 `
+        -ResourceGroup "rg-loadtest" `
+        -LoadTestResourceName "my-azure-load-testing-resource" `
+        -TestName "enduranceloadtest" `
+        -DestStorageAccount "mystorageacct" `
+        -DestContainer "loadtest" `
+        -DestSasToken "?sv=2022-11-02&ss=b&srt=co&sp=rwdlac...."
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroup,
+
+    [Parameter(Mandatory = $true)]
+    [string]$LoadTestResourceName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$TestName,                      # e.g. "enduranceloadtest" - this is the test's displayName
+
+    [Parameter(Mandatory = $true)]
+    [string]$DestStorageAccount,            # storage account that hosts the destination container
+
+    [string]$DestContainer = "loadtest",    # destination container name
+
+    [Parameter(Mandatory = $true)]
+    [string]$DestSasToken,                  # SAS token (starting with "?") with write permission on the container
+
+    [string]$ApiVersion = "2024-03-01-preview"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-Step($msg) {
+    Write-Host ""
+    Write-Host "==> $msg" -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------
+# 0. Sanity checks
+# ---------------------------------------------------------------------------
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw "Azure CLI (az) not found on PATH."
+}
+if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
+    throw "azcopy not found on PATH. Install it from https://aka.ms/downloadazcopy"
+}
+
+# ---------------------------------------------------------------------------
+# 1. Find the load test by display name and get its testId
+# ---------------------------------------------------------------------------
+Write-Step "Looking up load test '$TestName' in resource '$LoadTestResourceName'"
+
+$testsJson = az load test list `
+    --load-test-resource $LoadTestResourceName `
+    --resource-group $ResourceGroup `
+    -o json
+
+if (-not $testsJson) { throw "Failed to list load tests. Check resource name/resource group." }
+
+$tests = $testsJson | ConvertFrom-Json
+$test = $tests | Where-Object { $_.displayName -eq $TestName }
+
+if (-not $test) {
+    throw "No load test found with displayName '$TestName'."
+}
+
+$testId = $test.testId
+Write-Host "Found testId: $testId"
+
+# ---------------------------------------------------------------------------
+# 2. List test runs for that test and get the latest one
+# ---------------------------------------------------------------------------
+Write-Step "Fetching test runs for testId '$testId'"
+
+$runsJson = az load test-run list `
+    --load-test-resource $LoadTestResourceName `
+    --resource-group $ResourceGroup `
+    --test-id $testId `
+    -o json
+
+if (-not $runsJson) { throw "Failed to list test runs." }
+
+$runs = $runsJson | ConvertFrom-Json
+if (-not $runs -or $runs.Count -eq 0) {
+    throw "No test runs found for testId '$testId'."
+}
+
+$latestRun = $runs | Sort-Object { [datetime]$_.executedDateTime } -Descending | Select-Object -First 1
+$testRunId = $latestRun.testRunId
+Write-Host "Latest testRunId: $testRunId (executed $($latestRun.executedDateTime))"
+
+# ---------------------------------------------------------------------------
+# 3. Get the data-plane endpoint, then call REST API to get the artifact SAS URL
+# ---------------------------------------------------------------------------
+Write-Step "Resolving data-plane endpoint for '$LoadTestResourceName'"
+
+$dataPlaneUri = az load show `
+    --name $LoadTestResourceName `
+    --resource-group $ResourceGroup `
+    --query "dataPlaneURI" -o tsv
+
+if (-not $dataPlaneUri) { throw "Could not resolve data-plane URI." }
+Write-Host "Data-plane URI: $dataPlaneUri"
+
+Write-Step "Fetching test run details to get results artifact SAS URL"
+
+$restUrl = "https://$dataPlaneUri/test-runs/${testRunId}?api-version=$ApiVersion"
+
+$runDetailsJson = az rest `
+    --method get `
+    --url $restUrl `
+    --resource "https://cnt-prod.loadtesting.azure.com" `
+    -o json
+
+if (-not $runDetailsJson) { throw "Failed to fetch test run details from data-plane API." }
+
+$runDetails = $runDetailsJson | ConvertFrom-Json
+$resultFileInfo = $runDetails.testArtifacts.outputArtifacts.resultFileInfo
+
+if (-not $resultFileInfo -or -not $resultFileInfo.url) {
+    throw "No results.zip artifact found on this test run. It may still be processing."
+}
+
+$sourceSasUrl = $resultFileInfo.url
+$fileName = if ($resultFileInfo.fileName) { $resultFileInfo.fileName } else { "$testRunId-results.zip" }
+
+Write-Host "Artifact file: $fileName"
+
+# ---------------------------------------------------------------------------
+# 4. azcopy the results.zip into the destination container
+# ---------------------------------------------------------------------------
+Write-Step "Copying artifact to destination container '$DestContainer' via azcopy"
+
+$destUrl = "https://$DestStorageAccount.blob.core.windows.net/$DestContainer/$fileName$DestSasToken"
+
+azcopy copy "$sourceSasUrl" "$destUrl" --overwrite=true
+
+if ($LASTEXITCODE -ne 0) {
+    throw "azcopy copy failed with exit code $LASTEXITCODE"
+}
+
+Write-Step "Done. '$fileName' copied to container '$DestContainer' on '$DestStorageAccount'."
