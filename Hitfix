@@ -1,0 +1,150 @@
+# ============================================================
+# DEPLOYMENT PIPELINE
+# Supports:
+#
+# 1. Normal Release - MANUAL
+# 2. Hotfix - AUTOMATIC
+# ============================================================
+
+trigger: none
+
+pr: none
+
+
+# ============================================================
+# HOTFIX BUILD PIPELINE RESOURCE
+# ============================================================
+
+resources:
+
+  pipelines:
+
+  - pipeline: hotfixBuild
+    source: Hotfix-Build
+
+    trigger:
+      branches:
+        include:
+          - hotfix_release_*
+
+
+# ============================================================
+# MANUAL PARAMETERS
+#
+# These are used ONLY for normal release deployments.
+# Hotfix deployments don't need the user to select these.
+# ============================================================
+
+parameters:
+
+- name: deploymentType
+  displayName: 'Deployment Type'
+  type: string
+  default: Release
+  values:
+    - Release
+    - Hotfix
+
+
+- name: releaseArtifact
+  displayName: 'Release Artifact'
+  type: string
+  default: latest
+
+
+- name: deployPub
+  displayName: 'Deploy PUB'
+  type: boolean
+  default: false
+
+
+- name: deployAdmin
+  displayName: 'Deploy ADMIN'
+  type: boolean
+  default: false
+
+
+- name: deployDb
+  displayName: 'Deploy DB'
+  type: boolean
+  default: false
+
+
+# ============================================================
+# VARIABLES
+# ============================================================
+
+variables:
+
+- name: normalArtifactName
+  value: 'release'
+
+- name: hotfixArtifactName
+  value: 'hotfix'
+
+
+# ============================================================
+# STAGE 1 - DETERMINE DEPLOYMENT
+# ============================================================
+
+stages:
+
+- stage: DetermineDeployment
+  displayName: 'Determine Deployment Type'
+
+  jobs:
+
+  - job: Determine
+    displayName: 'Determine Artifact and Components'
+
+    steps:
+
+    - powershell: |
+
+        Write-Host "======================================"
+        Write-Host "Deployment Information"
+        Write-Host "======================================"
+
+        Write-Host "Reason: $(Build.Reason)"
+        Write-Host "Source Branch: $(Build.SourceBranch)"
+        Write-Host "Source Version: $(Build.SourceVersion)"
+
+        # ------------------------------------------------
+        # HOTFIX
+        # ------------------------------------------------
+
+        if ("$(Build.Reason)" -eq "ResourceTrigger")
+        {
+            Write-Host "HOTFIX deployment detected"
+
+            Write-Host "##vso[task.setvariable variable=DeploymentType;isOutput=true]Hotfix"
+
+            Write-Host "##vso[task.setvariable variable=ArtifactName;isOutput=true]hotfix"
+
+            Write-Host "##vso[task.setvariable variable=DeployPUB;isOutput=true]true"
+
+            Write-Host "##vso[task.setvariable variable=DeployADMIN;isOutput=true]true"
+
+            Write-Host "##vso[task.setvariable variable=DeployDB;isOutput=true]false"
+        }
+
+        # ------------------------------------------------
+        # NORMAL RELEASE
+        # ------------------------------------------------
+
+        else
+        {
+            Write-Host "NORMAL RELEASE deployment detected"
+
+            Write-Host "##vso[task.setvariable variable=DeploymentType;isOutput=true]Release"
+
+            Write-Host "##vso[task.setvariable variable=ArtifactName;isOutput=true]release"
+
+            Write-Host "##vso[task.setvariable variable=DeployPUB;isOutput=true]${{ parameters.deployPub }}"
+
+            Write-Host "##vso[task.setvariable variable=DeployADMIN;isOutput=true]${{ parameters.deployAdmin }}"
+
+            Write-Host "##vso[task.setvariable variable=DeployDB;isOutput=true]${{ parameters.deployDb }}"
+        }
+
+      name: deploymentVariables
