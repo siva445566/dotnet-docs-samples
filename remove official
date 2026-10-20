@@ -1,0 +1,45 @@
+$StorageAccountName = "yourstorageaccount"
+$StorageAccountKey  = "your-storage-account-key"
+$ContainerName      = "your-container-name"
+
+$Context = New-AzStorageContext `
+    -StorageAccountName $StorageAccountName `
+    -StorageAccountKey $StorageAccountKey
+
+$Blobs = Get-AzStorageBlob -Container $ContainerName -Context $Context
+
+foreach ($Blob in $Blobs) {
+
+    if ($Blob.Name -match '^Official_Sensitive_') {
+
+        $NewName = $Blob.Name -replace '^Official_Sensitive_', ''
+
+        Write-Host "Renaming $($Blob.Name) to $NewName"
+
+        Start-AzStorageBlobCopy `
+            -SrcBlob $Blob.Name `
+            -SrcContainer $ContainerName `
+            -DestBlob $NewName `
+            -DestContainer $ContainerName `
+            -Context $Context | Out-Null
+
+        do {
+            Start-Sleep -Seconds 2
+            $CopyState = Get-AzStorageBlobCopyState `
+                -Blob $NewName `
+                -Container $ContainerName `
+                -Context $Context
+        } while ($CopyState.Status -eq "Pending")
+
+        if ($CopyState.Status -eq "Success") {
+            Remove-AzStorageBlob `
+                -Blob $Blob.Name `
+                -Container $ContainerName `
+                -Context $Context `
+                -Force
+        }
+        else {
+            Write-Host "Copy failed. Original retained: $($Blob.Name)"
+        }
+    }
+}
